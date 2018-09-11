@@ -1,0 +1,30 @@
+Copyright (C) 2009-2018, Kaz Kylheku <kaz@kylheku.com>.
+All rights reserved.
+
+The document named LICENSE specifies the license for the TXR program,
+including the linenoise library which it uses, found in the
+linenoise/ subdirectory. Linenoise uses exactly the same Two-Clause
+BSD License, and so the two licenses are combined.
+
+The MPI library, found in the mpi/ subdirectory, was developed over
+the yeras 1998-2006 by Michael J. Fromberger. Its license consists
+of the mpi/README file, which states:
+
+   This software is in the public domain.  It is entirely free, and you
+   may use it and/or redistribute it for whatever purpose you choose;
+   however, as free software, it is provided without warranty of any
+   kind, not even the implied warranty of merchantability or fitness for
+   a particular purpose.
+
+Whether or not software can be explicitly deposited into the public domain is
+controversial, so the MPI library may have to be regarded as being copyrighted
+by Michael J. Fromberger. The above text can be reasonably understood to
+constitute a license grant which is compatible with TXR's Two-Clause BSD
+license in the sense that it is at least as permissive.
+
+TXR is ported to Windows with the help of a derivative of the Cygwin library.
+For user convenience, a packaged version of TXR includes the CYGWIN1.DLL, in
+accordance with the terms of Cygwin's license, the GNU Lesser Public License,
+Version 3.  More details are in the document LICENSE-CYG, which is incorporated
+into the Windows installer and displayed to users during installation to inform
+them of the dependency on a LGPL-ed library.

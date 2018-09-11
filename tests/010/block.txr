@@ -1,0 +1,7 @@
+@(next :tlist ("abc" "yyy"))
+@(block foo)
+@line
+@(accept foo)
+xxx
+@(end)
+yyy

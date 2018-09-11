@@ -1,0 +1,952 @@
+;; Copyright 2015-2018
+;; Kaz Kylheku <kaz@kylheku.com>
+;; Vancouver, Canada
+;; All rights reserved.
+;;
+;; Redistribution and use in source and binary forms, with or without
+;; modification, are permitted provided that the following conditions are met:
+;;
+;; 1. Redistributions of source code must retain the above copyright notice, this
+;;    list of conditions and the following disclaimer.
+;;
+;; 2. Redistributions in binary form must reproduce the above copyright notice,
+;;    this list of conditions and the following disclaimer in the documentation
+;;    and/or other materials provided with the distribution.
+;;
+;; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+;; ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+;; WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+;; DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+;; FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+;; DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+;; SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+;; CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+;; OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+;; OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+(defvar *place-clobber-expander* (hash))
+(defvar *place-update-expander* (hash))
+(defvar *place-delete-expander* (hash))
+(defvar *place-macro* (hash))
+(defvar sys:*pl-env* nil)
+
+(defun sys:eval-err (. params)
+  (throwf 'eval-error . params))
+
+(defun sys:sym-update-expander (getter-name setter-name
+                                place-expr op-body)
+  ^(macrolet ((,getter-name () ',place-expr)
+              (,setter-name (val-expr) ^(sys:setq ,',place-expr
+                                                  ,val-expr)))
+     ,op-body))
+
+(defun sys:sym-clobber-expander (simple-setter-name
+                                 place-expr op-body)
+  ^(macrolet ((,simple-setter-name (val-expr)
+                 ^(sys:setq ,',place-expr ,val-expr)))
+     ,op-body))
+
+(defun sys:sym-delete-expander (deleter-name
+                                place-expr . op-body)
+  ^(macrolet ((,deleter-name (:env env)
+                (when (lexical-var-p env ',place-expr)
+                  (sys:eval-err "~s is a lexical variable, thus not deletable"
+                                ',place-expr))
+                ^(prog1
+                   (symbol-value ',',place-expr)
+                   (makunbound ',',place-expr))))
+     ,*op-body))
+
+(defun sys:get-place-macro (sym)
+  (or [*place-macro* sym]
+      (progn (sys:try-load sym) [*place-macro* sym])))
+
+(defun sys:pl-expand (unex-place env)
+  (while t
+    (let ((place unex-place))
+      (let ((pm-expander (sys:get-place-macro (if (consp unex-place)
+                                                (car unex-place)))))
+        (when pm-expander
+          (sys:setq place (sys:set-macro-ancestor
+                            [pm-expander unex-place]
+                            unex-place))))
+      (sys:setq place (macroexpand-1 place env))
+      (when (or (eq place unex-place)
+                (null place)
+                (and (atom place) (not (symbolp place))))
+        (return place))
+      (sys:setq unex-place place))))
+
+(defun place-form-p (unex-place env)
+  (let ((place (sys:pl-expand unex-place env)))
+    (or (bindable place)
+        (and (consp place) [*place-update-expander* (car place)] t))))
+
+(defun get-update-expander (place)
+  (cond
+    ((symbolp place) (fun sys:sym-update-expander))
+    ((consp place) (or [*place-update-expander* (car place)]
+                       (sys:eval-err "~s is not an assignable place" place)))
+    (t (sys:eval-err "form ~s is not syntax denoting an assignable place" place))))
+
+(defun get-clobber-expander (place)
+  (cond
+    ((symbolp place) (fun sys:sym-clobber-expander))
+    ((consp place) (or [*place-clobber-expander* (car place)]
+                       (iflet ((fun [*place-update-expander* (car place)]))
+                          (op apply fun (gensym) @1 @2 @rest))
+                       (sys:eval-err "~s is not an assignable place" place)))
+    (t (sys:eval-err "form ~s is not syntax denoting an assignable place" place))))
+
+(defun get-delete-expander (place)
+  (cond
+    ((symbolp place) (fun sys:sym-delete-expander))
+    ((consp place) (or [*place-delete-expander* (car place)]
+                       (sys:eval-err "~s is not a deletable place" place)))
+    (t (sys:eval-err "form ~s is not syntax denoting a deletable place" place))))
+
+(defun sys:r-s-let-expander (bindings body e letsym pred)
+  (let ((exp-bindings (mapcar (aret ^(,@1 ,(macroexpand @2 e))) bindings)))
+    (let ((renames [keep-if pred exp-bindings second])
+          (regular [remove-if pred exp-bindings second]))
+    (cond ((and renames regular)
+            ^(symacrolet ,renames
+               (,letsym ,regular ,*body)))
+          (renames ^(symacrolet ,renames ,*body))
+          (regular ^(,letsym ,regular ,*body))
+          (t ^(progn ,*body))))))
+
+(defmacro rlet (bindings :env e . body)
+  [sys:r-s-let-expander bindings body e 'let constantp])
+
+(defmacro slet (bindings :env e . body)
+  (sys:r-s-let-expander bindings body e 'let [orf constantp bindable]))
+
+(defmacro alet (bindings :env e . body)
+  (let ((exp-bindings (mapcar (aret ^(,@1 ,(macroexpand @2 e))) bindings)))
+    (if [some exp-bindings constantp second]
+      [sys:r-s-let-expander exp-bindings body e 'alet constantp]
+      ^(,(if [all exp-bindings bindable second]
+           'symacrolet 'let)
+         ,exp-bindings ,*body))))
+
+(defmacro with-gensyms (syms . body)
+  ^(let ,(zip syms (repeat '((gensym)))) ,*body))
+
+(defun sys:propagate-ancestor (to-tree from-form . syms)
+  (tree-case to-tree
+    ((a . d)
+     (when (memq a syms)
+       (sys:set-macro-ancestor to-tree from-form))
+     (sys:propagate-ancestor a from-form . syms)
+     (sys:propagate-ancestor d from-form . syms)))
+  to-tree)
+
+(defun call-update-expander (getter setter unex-place env body)
+  (sys:propagate-ancestor body unex-place getter setter)
+  (let* ((place (sys:pl-expand unex-place env))
+         (expander (get-update-expander place))
+         (sys:*pl-env* env)
+         (expansion [expander getter setter place body])
+         (expansion-ex (sys:expand expansion env)))
+    (sys:propagate-ancestor expansion-ex place getter setter)))
+
+(defun call-clobber-expander (ssetter unex-place env body)
+  (sys:propagate-ancestor body unex-place ssetter)
+  (let* ((place (sys:pl-expand unex-place env))
+         (expander (get-clobber-expander place))
+         (sys:*pl-env* env)
+         (expansion [expander ssetter place body])
+         (expansion-ex (sys:expand expansion env)))
+    (sys:propagate-ancestor expansion-ex place ssetter)))
+
+(defun call-delete-expander (deleter unex-place env body)
+  (sys:propagate-ancestor body unex-place deleter)
+  (let* ((place (sys:pl-expand unex-place env))
+         (expander (get-delete-expander place))
+         (sys:*pl-env* env)
+         (expansion [expander deleter place body])
+         (expansion-ex (sys:expand expansion env)))
+    (sys:propagate-ancestor expansion-ex place deleter)))
+
+(defmacro with-update-expander ((getter setter) unex-place env body)
+  ^(with-gensyms (,getter ,setter)
+     (call-update-expander ,getter ,setter ,unex-place ,env ,body)))
+
+(defmacro with-clobber-expander ((ssetter) unex-place env body)
+  ^(with-gensyms (,ssetter)
+     (call-clobber-expander ,ssetter ,unex-place ,env ,body)))
+
+(defmacro with-delete-expander ((deleter) unex-place env body)
+  ^(with-gensyms (,deleter)
+     (call-delete-expander ,deleter ,unex-place ,env ,body)))
+
+(defmacro set (:env env . place-value-pairs)
+  (let ((assign-forms (mapcar (tb ((place : (value nil value-present-p)))
+                                (unless value-present-p
+                                  (sys:eval-err "set: arguments must be pairs"))
+                                (with-clobber-expander (ssetter) place env
+                                   ^(,ssetter ,value)))
+                              (tuples 2 place-value-pairs))))
+    (if (cdr assign-forms)
+      ^(progn ,*assign-forms)
+      (car assign-forms))))
+
+(defmacro pset (:env env . place-value-pairs)
+  (let ((len (length place-value-pairs)))
+    (cond
+      ((oddp len) (sys:eval-err "pset: arguments must be pairs"))
+      ((<= len 2) ^(set ,*place-value-pairs))
+      (t (let* ((pvtgs (mapcar (tb ((a b))
+                                 (list a b (gensym) (gensym) (gensym)))
+                               (tuples 2 place-value-pairs)))
+                (ls (reduce-left (tb ((lets stores) (place value temp getter setter))
+                                     (list ^((,temp ,value) ,*lets)
+                                           ^((,setter ,temp) ,*stores)))
+                                 pvtgs '(nil nil)))
+                (lets (first ls))
+                (stores (second ls))
+                (body-form ^(rlet (,*lets) ,*stores)))
+           (reduce-left (tb (accum-form (place value temp getter setter))
+                          (call-update-expander getter setter
+                                                place env accum-form))
+                        pvtgs body-form))))))
+
+(defmacro zap (place : (new-val nil) :env env)
+  (with-update-expander (getter setter) place env
+    ^(prog1 (,getter) (,setter ,new-val))))
+
+(defmacro flip (place :env env)
+  (with-update-expander (getter setter) place env
+    ^(,setter (not (,getter)))))
+
+(defmacro inc (place : (delta 1) :env env)
+  (with-update-expander (getter setter) place env
+    (caseql delta
+      (0 place)
+      (1 ^(,setter (succ (,getter))))
+      (2 ^(,setter (ssucc (,getter))))
+      (3 ^(,setter (sssucc (,getter))))
+      (t ^(,setter (+ (,getter) ,delta))))))
+
+(defmacro dec (place : (delta 1) :env env)
+  (with-update-expander (getter setter) place env
+    (caseql delta
+      (0 place)
+      (1 ^(,setter (pred (,getter))))
+      (2 ^(,setter (ppred (,getter))))
+      (3 ^(,setter (pppred (,getter))))
+      (t ^(,setter (- (,getter) ,delta))))))
+
+(defmacro pinc (place : (delta 1) :env env)
+  (with-gensyms (oldval)
+    (with-update-expander (getter setter) place env
+      (caseql delta
+        (0 place)
+        (1 ^(let ((,oldval (,getter))) (,setter (succ ,oldval)) ,oldval))
+        (2 ^(let ((,oldval (,getter))) (,setter (ssucc ,oldval)) ,oldval))
+        (3 ^(let ((,oldval (,getter))) (,setter (sssucc ,oldval)) ,oldval))
+        (t ^(let ((,oldval (,getter))) (,setter (+ ,oldval, delta)) ,oldval))))))
+
+(defmacro pdec (place : (delta 1) :env env)
+  (with-gensyms (oldval)
+    (with-update-expander (getter setter) place env
+      (caseql delta
+        (0 place)
+        (1 ^(let ((,oldval (,getter))) (,setter (pred ,oldval)) ,oldval))
+        (2 ^(let ((,oldval (,getter))) (,setter (ppred ,oldval)) ,oldval))
+        (3 ^(let ((,oldval (,getter))) (,setter (pppred ,oldval)) ,oldval))
+        (t ^(let ((,oldval (,getter))) (,setter (- ,oldval, delta)) ,oldval))))))
+
+(defmacro swap (place-0 place-1 :env env)
+  (with-gensyms (tmp)
+    (with-update-expander (getter-0 setter-0) place-0 env
+      (with-update-expander (getter-1 setter-1) place-1 env
+        ^(let ((,tmp (,getter-0)))
+           (,setter-0 (,getter-1))
+           (,setter-1 ,tmp))))))
+
+(defmacro push (new-item place :env env)
+  (with-gensyms (new-sym)
+    ^(alet ((,new-sym ,new-item))
+       ,(with-update-expander (getter setter) place env
+          ^(,setter (cons ,new-sym (,getter)))))))
+
+(defmacro pop (place :env env)
+  (with-gensyms (tmp)
+    (with-update-expander (getter setter) place env
+      ^(let ((,tmp (,getter)))
+         (prog1 (car ,tmp) (,setter (cdr ,tmp)))))))
+
+(defmacro pushnew (new-item place :env env :
+                            (testfun :)
+                            (keyfun :))
+  (with-update-expander (getter setter) place env
+    (with-gensyms (new-item-sym old-list-sym)
+      ^(rlet ((,new-item-sym ,new-item))
+         ,(with-update-expander (getter setter) place env
+            ^(let ((,old-list-sym (,getter)))
+               (if (member ,new-item-sym ,old-list-sym ,testfun ,keyfun)
+                 ,old-list-sym
+                 (,setter (cons ,new-item-sym ,old-list-sym)))))))))
+
+(defmacro shift (:env env . places)
+  (tree-case places
+    (() (compile-error "~s: need at least two arguments" 'shift))
+    ((place) (compile-error "~s: need at least two arguments" 'shift))
+    ((place newvalue)
+     (with-update-expander (getter setter) place env
+        ^(prog1 (,getter) (,setter ,newvalue))))
+    ((place . others)
+      (with-update-expander (getter setter) place env
+        ^(prog1 (,getter) (,setter (shift ,*others)))))))
+
+(defmacro rotate (:env env . places)
+  (tree-case places
+    (() ())
+    ((fplace) fplace)
+    ((fplace . rplaces)
+     (with-gensyms (tmp)
+       (with-update-expander (getter-f setter-f) fplace env
+         ^(let ((,tmp (,getter-f)))
+            (,setter-f (shift ,*rplaces ,tmp))
+            ,tmp))))))
+
+(defmacro test-set (:env env place)
+  (with-update-expander (getter setter) place env
+    ^(unless (,getter)
+       (,setter t))))
+
+(defmacro test-clear (:env env place)
+  (with-update-expander (getter setter) place env
+    ^(when (,getter)
+       (,setter nil)
+       t)))
+
+(defmacro compare-swap (:env env comp-fun place comp-val store-val)
+  (with-update-expander (getter setter) place env
+    ^(when (,comp-fun (,getter) ,comp-val)
+       (,setter ,store-val)
+       t)))
+
+(defmacro test-inc (place : (delta 1) (upfrom-val 0))
+  ^(eql (pinc ,place ,delta) ,upfrom-val))
+
+(defmacro test-dec (place : (delta 1) (downto-val 0))
+  ^(eql (dec ,place ,delta) ,downto-val))
+
+(defmacro del (place :env env)
+  (with-delete-expander (deleter) place env
+    ^(,deleter)))
+
+(defmacro lset (. places-source)
+  (let ((places (butlast places-source))
+        (source (last places-source))
+        (orig (gensym))
+        (iter (gensym)))
+    (unless places
+      (compile-error "~s: require one or more places followed by expression"
+                     'lset))
+    ^(let* ((,orig ,(car source))
+            (,iter ,orig))
+       ,*(butlast (mappend (ret ^((set ,@1 (car ,iter)) (set ,iter (cdr ,iter))))
+                           places))
+       ,orig)))
+
+(defmacro upd (place . opip-args)
+  (with-gensyms (pl)
+    ^(placelet ((,pl ,place))
+       (set ,pl (call (opip ,*opip-args) ,pl)))))
+
+(defmacro defplace (place-destructuring-args body-sym
+                    (getter-sym setter-sym update-body) :
+                    ((ssetter-sym clobber-body))
+                    ((deleter-sym delete-body)))
+  (let ((name (car place-destructuring-args))
+        (args (cdr place-destructuring-args)))
+    (unless (and name
+                 (symbolp name)
+                 (not (keywordp name))
+                 (not (eq t name)))
+      (compile-error "~s: ~s cannot be used as a place name"
+                     'defplace name))
+    (with-gensyms (place)
+      ^(progn
+         (sethash *place-update-expander* ',name
+           (lambda (,getter-sym ,setter-sym ,place ,body-sym)
+             (tree-bind ,args (cdr ,place)
+                ,update-body)))
+         ,*(if ssetter-sym
+            ^((sethash *place-clobber-expander* ',name
+                (lambda (,ssetter-sym ,place ,body-sym)
+                  (tree-bind ,args (cdr ,place)
+                     ,clobber-body)))))
+         ,*(if deleter-sym
+             ^((sethash *place-delete-expander* ',name
+                 (lambda (,deleter-sym ,place ,body-sym)
+                   (tree-bind ,args (cdr ,place)
+                      ,delete-body)))))
+         ',name))))
+
+(defmacro define-place-macro (name place-destructuring-args . body)
+  (with-gensyms (name-dummy args)
+    ^(progn
+       (sethash *place-macro* ',name
+                (lambda (,args)
+                  (mac-param-bind ,args
+                                  (,name-dummy ,*place-destructuring-args)
+                                  ,args ,*body)))
+       ',name)))
+
+(defplace (sys:var arg) body
+  (getter setter
+    ^(macrolet ((,getter () ^(sys:var ,',arg))
+                (,setter (val) ^(sys:setq ,'(sys:var ,arg) ,val)))
+       ,body)))
+
+(defplace (sys:l1-val arg) body
+  (getter setter
+    ^(macrolet ((,getter () ^(sys:l1-val ,',arg))
+                (,setter (val) ^(sys:l1-setq ,',arg ,val)))
+         ,body))
+  (ssetter
+    ^(macrolet ((,ssetter (val) ^(sys:l1-setq ,',arg ,val)))
+       ,body)))
+
+(defplace (sys:lisp1-value arg) body
+  (getter setter
+    ^(macrolet ((,getter () ^(sys:lisp1-value ,',arg))
+                (,setter (val) ^(sys:lisp1-setq ,',arg ,val)))
+         ,body))
+  (ssetter
+    ^(macrolet ((,ssetter (val) ^(sys:lisp1-setq ,',arg ,val)))
+       ,body)))
+
+(defplace (car cell) body
+  (getter setter
+    (with-gensyms (cell-sym)
+      ^(slet ((,cell-sym ,cell))
+         (macrolet ((,getter () ^(car ,',cell-sym))
+                    (,setter (val) ^(sys:rplaca ,',cell-sym ,val)))
+           ,body))))
+  (ssetter
+    ^(macrolet ((,ssetter (val) ^(sys:rplaca ,',cell ,val)))
+      ,body))
+  (deleter
+    ^(macrolet ((,deleter () ^(pop ,',cell)))
+       ,body)))
+
+(defplace (cdr cell) body
+  (getter setter
+    (with-gensyms (cell-sym)
+      ^(slet ((,cell-sym ,cell))
+         (macrolet ((,getter () ^(cdr ,',cell-sym))
+                    (,setter (val) ^(sys:rplacd ,',cell-sym ,val)))
+           ,body))))
+  (ssetter
+    ^(macrolet ((,ssetter (val) ^(sys:rplacd ,',cell ,val)))
+       ,body))
+  (deleter
+    ^(macrolet ((,deleter ()
+                  (with-gensyms (tmp)
+                    (with-update-expander (cgetter csetter) ',cell nil
+                      ^(let ((,tmp (,cgetter)))
+                         (prog1 (cdr ,tmp) (,csetter (car ,tmp))))))))
+       ,body)))
+
+(defplace (nthcdr index list) body
+  (getter setter
+    (with-gensyms (index-sym list-sym sentinel-head-sym parent-cell-sym)
+      (if (place-form-p list sys:*pl-env*)
+        (with-update-expander (lgetter lsetter) list sys:*pl-env*
+          ^(alet ((,index-sym ,index)
+                  (,list-sym (,lgetter)))
+             (let* ((,sentinel-head-sym (cons nil ,list-sym))
+                    (,parent-cell-sym (nthcdr ,index-sym ,sentinel-head-sym)))
+               (macrolet ((,getter () ^(cdr ,',parent-cell-sym))
+                          (,setter (val)
+                            ^(prog1 (sys:rplacd ,',parent-cell-sym ,val)
+                                    (,',lsetter (cdr ,',sentinel-head-sym)))))
+                 ,body))))
+        ^(alet ((,index-sym ,index)
+                (,list-sym ,list))
+           (let ((,parent-cell-sym (nthcdr (pred ,index-sym) ,list-sym)))
+             (macrolet ((,getter () ^(cdr ,',parent-cell-sym))
+                        (,setter (val)
+                          ^(sys:rplacd ,',parent-cell-sym ,val)))
+               ,body)))))))
+
+(defplace (nthlast index list) body
+  (getter setter
+    (with-gensyms (index-sym list-sym sentinel-head-sym parent-cell-sym)
+      (if (place-form-p list sys:*pl-env*)
+        (with-update-expander (lgetter lsetter) list sys:*pl-env*
+          ^(alet ((,index-sym ,index)
+                  (,list-sym (,lgetter)))
+             (let* ((,sentinel-head-sym (cons nil ,list-sym))
+                    (,parent-cell-sym (nthlast (succ ,index-sym)
+                                               ,sentinel-head-sym)))
+               (macrolet ((,getter () ^(cdr ,',parent-cell-sym))
+                          (,setter (val)
+                            ^(prog1 (sys:rplacd ,',parent-cell-sym ,val)
+                                    (,',lsetter (cdr ,',sentinel-head-sym)))))
+                 ,body))))
+        ^(alet ((,index-sym index)
+                (,list-sym ,list))
+           (let ((,parent-cell-sym (nthlast (succ ,index-sym) ,list-sym)))
+             (macrolet ((,getter () ^(cdr ,',parent-cell-sym))
+                        (,setter (val)
+                          ^(sys:rplacd ,',parent-cell-sym ,val)))
+               ,body)))))))
+
+(defplace (butlastn num list) body
+  (getter setter
+    (with-gensyms (num-sym list-sym head-sym tail-sym val-sym)
+      (with-update-expander (lgetter lsetter) list sys:*pl-env*
+        ^(alet ((,num-sym ,num)
+                (,list-sym (,lgetter)))
+           (let* ((,tail-sym (nthlast ,num-sym ,list-sym))
+                  (,head-sym (ldiff ,list-sym ,tail-sym)))
+             (macrolet ((,getter () ,head-sym)
+                        (,setter (val)
+                           ^(alet ((,',val-sym ,val))
+                              (progn (,',lsetter (append ,',val-sym
+                                                         ,',tail-sym))
+                                     ,',val-sym))))
+               ,body)))))))
+
+(defplace (vecref vector index :whole args) body
+  (getter setter
+    (with-gensyms (vec-sym ind-sym)
+      ^(alet ((,vec-sym ,vector)
+              (,ind-sym ,index))
+         (macrolet ((,getter () ^(vecref ,',vec-sym ,',ind-sym))
+                    (,setter (val) ^(refset ,',vec-sym ,',ind-sym ,val)))
+            ,body))))
+  (ssetter
+    ^(macrolet ((,ssetter (val) ^(refset ,*',args ,val)))
+       ,body))
+  (deleter
+    (with-gensyms (vec-sym ind-sym)
+      ^(alet ((,vec-sym ,vector)
+              (,ind-sym ,index))
+         (macrolet ((,deleter ()
+                       ^(prog1 (vecref ,',vec-sym ,',ind-sym)
+                               (replace-vec ,',vec-sym nil
+                                            ,',ind-sym (succ ,',ind-sym)))))
+           ,body)))))
+
+(defplace (chr-str string index :whole args) body
+  (getter setter
+    (with-gensyms (str-sym ind-sym)
+      ^(alet ((,str-sym ,string)
+              (,ind-sym ,index))
+         (macrolet ((,getter () ^(chr-str ,',str-sym ,',ind-sym))
+                    (,setter (val) ^(chr-str-set ,',str-sym ,',ind-sym ,val)))
+            ,body))))
+  (ssetter
+    ^(macrolet ((,ssetter (val) ^(chr-str-set ,*',args ,val)))
+       ,body))
+  (deleter
+    (with-gensyms (str-sym ind-sym)
+      ^(alet ((,str-sym ,string)
+              (,ind-sym ,index))
+         (macrolet ((,deleter ()
+                       ^(prog1 (chr-str ,',str-sym ,',ind-sym)
+                               (replace-str ,',str-sym nil
+                                            ,',ind-sym (succ ,',ind-sym)))))
+           ,body)))))
+
+(defplace (ref seq index :whole args) body
+  (getter setter
+    (with-gensyms (seq-sym ind-sym)
+      ^(alet ((,seq-sym ,seq)
+              (,ind-sym ,index))
+         (macrolet ((,getter () ^(ref ,',seq-sym ,',ind-sym))
+                    (,setter (val) ^(refset ,',seq-sym ,',ind-sym ,val)))
+            ,body))))
+  (ssetter
+    ^(macrolet ((,ssetter (val) ^(refset ,*',args ,val)))
+       ,body))
+  (deleter
+    (with-gensyms (seq-sym ind-sym)
+      ^(alet ((,seq-sym ,seq)
+              (,ind-sym ,index))
+         (macrolet ((,deleter ()
+                       ^(prog1 (ref ,',seq-sym ,',ind-sym)
+                               (replace ,',seq-sym nil
+                                        ,',ind-sym (succ ,',ind-sym)))))
+           ,body)))))
+
+(defplace (sub seq :whole args : (from 0) (to t)) body
+  (getter setter
+    (with-gensyms (seq-sym from-sym to-sym v-sym)
+      (with-update-expander (seq-getter seq-setter) seq sys:*pl-env*
+        ^(alet ((,seq-sym (,seq-getter))
+                (,from-sym ,from)
+                (,to-sym ,to))
+           (macrolet ((,getter () ^(sub ,',seq-sym ,',from-sym ,',to-sym))
+                      (,setter (val)
+                        ^(alet ((,',v-sym ,val))
+                           (,',seq-setter (replace ,',seq-sym ,',v-sym
+                                                   ,',from-sym ,',to-sym))
+                           ,',v-sym)))
+              ,body)))))
+  (ssetter
+    (with-gensyms (seq-sym from-sym to-sym v-sym)
+      (with-update-expander (seq-getter seq-setter) seq sys:*pl-env*
+        ^(macrolet ((,ssetter (val)
+                     ^(alet ((,',seq-sym (,',seq-getter))
+                             (,',from-sym ,',from)
+                             (,',to-sym ,',to)
+                             (,',v-sym ,val))
+                        (,',seq-setter (replace ,',seq-sym ,',v-sym
+                                                ,',from-sym ,',to-sym))
+                        ,',v-sym)))
+        ,body))))
+  (deleter
+    (with-gensyms (seq-sym from-sym to-sym)
+      (with-update-expander (seq-getter seq-setter) seq sys:*pl-env*
+        ^(alet ((,seq-sym (,seq-getter))
+                (,from-sym ,from)
+                (,to-sym ,to))
+           (macrolet ((,deleter ()
+                         ^(prog1
+                            (sub ,',seq-sym ,',from-sym ,',to-sym)
+                            (,',seq-setter (replace ,',seq-sym nil
+                                                    ,',from-sym ,',to-sym)))))
+             ,body))))))
+
+(defplace (gethash hash key : (default nil have-default-p)) body
+  (getter setter
+    (with-gensyms (entry-sym)
+      ^(let ((,entry-sym (inhash ,hash ,key ,default)))
+         (macrolet ((,getter () ^(cdr ,',entry-sym))
+                    (,setter (val) ^(sys:rplacd ,',entry-sym ,val)))
+            ,body))))
+  nil
+  (deleter
+    ^(macrolet ((,deleter ()
+                  (if ,have-default-p
+                    (with-gensyms (entry-sym
+                                   dfl-sym)
+                      ^(alet ((,entry-sym (inhash ,',hash ,',key))
+                              (,dfl-sym ,',default))
+                         (if ,entry-sym
+                           (remhash ,',hash ,',key)
+                           ,dfl-sym)))
+                    ^(remhash ,',hash ,',key))))
+       ,body)))
+
+(defplace (hash-userdata hash) body
+  (getter setter
+    (with-gensyms (hash-sym)
+      ^(slet ((,hash-sym ,hash))
+         (macrolet ((,getter () ^(hash-userdata ,',hash-sym))
+                    (,setter (val) ^(set-hash-userdata ,',hash-sym ,val)))
+            ,body))))
+  (ssetter
+    ^(macrolet ((,ssetter (val)
+                  ^(set-hash-userdata ,',hash ,val)))
+      ,body)))
+
+(defplace (dwim obj-place :env env . args) body
+  (getter setter
+    (with-gensyms (ogetter-sym osetter-sym obj-sym newval-sym)
+      (let ((arg-syms (mapcar (ret (gensym)) args)))
+        (if (place-form-p obj-place sys:*pl-env*)
+          (with-update-expander (ogetter-sym osetter-sym)
+                                ^(sys:l1-val ,obj-place) sys:*pl-env*
+            ^(rlet ((,obj-sym (,ogetter-sym))
+                    ,*(mapcar (ret ^(,@1 (sys:l1-val ,@2))) arg-syms args))
+               (macrolet ((,getter ()
+                            '[,obj-sym ,*arg-syms])
+                          (,setter (val)
+                            ^(rlet ((,',newval-sym ,val))
+                               (,',osetter-sym
+                                 (sys:dwim-set t ,',obj-sym
+                                               ,*',arg-syms ,',newval-sym))
+                               ,',newval-sym)))
+                 ,body)))
+          ^(rlet ((,obj-sym ,obj-place)
+                  ,*(mapcar (ret ^(,@1 (sys:l1-val ,@2))) arg-syms args))
+             (macrolet ((,getter ()
+                          '[,obj-sym ,*arg-syms])
+                        (,setter (val)
+                          ^(rlet ((,',newval-sym ,val))
+                             (sys:dwim-set nil ,',obj-sym
+                                           ,*',arg-syms ,',newval-sym)
+                             ,',newval-sym)))
+               ,body))))))
+  (ssetter
+    (with-gensyms (osetter-sym ogetter-sym obj-sym newval-sym)
+      (let ((arg-syms (mapcar (ret (gensym)) args)))
+        (if (place-form-p obj-place sys:*pl-env*)
+          (with-update-expander (ogetter-sym osetter-sym)
+                                ^(sys:l1-val ,obj-place) sys:*pl-env*
+            ^(macrolet ((,ssetter (val)
+                         ^(rlet ((,',obj-sym (,',ogetter-sym))
+                                 ,*(mapcar (ret ^(,@1 (sys:l1-val ,@2)))
+                                           ',arg-syms ',args)
+                                 (,',newval-sym ,val))
+                            (,',osetter-sym
+                              (sys:dwim-set t ,',obj-sym
+                                            ,*',arg-syms
+                                            ,',newval-sym))
+                            ,',newval-sym)))
+                 ,body))
+          ^(macrolet ((,ssetter (val)
+                       ^(rlet ((,',obj-sym ,',obj-place)
+                               ,*(mapcar (ret ^(,@1 (sys:l1-val ,@2)))
+                                         ',arg-syms ',args)
+                               (,',newval-sym ,val))
+                          (sys:dwim-set nil ,',obj-sym
+                                        ,*',arg-syms
+                                        ,',newval-sym)
+                          ,',newval-sym)))
+               ,body)))))
+
+  (deleter
+    (with-gensyms (osetter-sym ogetter-sym obj-sym oldval-sym)
+      (let ((arg-syms (mapcar (ret (gensym)) args)))
+        (if (place-form-p obj-place sys:*pl-env*)
+          (with-update-expander (ogetter-sym osetter-sym)
+                                ^(sys:l1-val ,obj-place) sys:*pl-env*
+            ^(macrolet ((,deleter ()
+                         ^(rlet ((,',obj-sym (,',ogetter-sym))
+                                 ,*(mapcar (ret ^(,@1 (sys:l1-val ,@2)))
+                                           ',arg-syms ',args))
+                            (let ((,',oldval-sym [,',obj-sym ,*',arg-syms]))
+                              (progn
+                                (,',osetter-sym
+                                  (sys:dwim-del t ,',obj-sym ,*',arg-syms))
+                                ,',oldval-sym)))))
+                 ,body))
+            ^(macrolet ((,deleter ()
+                         ^(rlet ((,',obj-sym ,',obj-place)
+                                 ,*(mapcar (ret ^(,@1 (sys:l1-val ,@2)))
+                                           ',arg-syms ',args))
+                            (let ((,',oldval-sym [,',obj-sym ,*',arg-syms]))
+                              (progn
+                                (sys:dwim-del nil ,',obj-sym ,*',arg-syms)
+                                ,',oldval-sym)))))
+                 ,body))))))
+
+(defplace (force promise) body
+  (getter setter
+    (with-gensyms (promise-sym)
+      ^(rlet ((,promise-sym ,promise))
+          (macrolet ((,getter ()
+                        ^(force ,',promise-sym))
+                     (,setter (val)
+                        ^(set (car (cdr ,',promise-sym)) ,val)))
+            ,body))))
+  (ssetter
+    (with-gensyms (promise-sym)
+      ^(rlet ((,promise-sym ,promise))
+         (macrolet ((,ssetter (val)
+                      ^(prog1
+                         (set (car (cdr ,',promise-sym)) ,val)
+                         (set (car ,',promise-sym) 'sys:promise-forced))))
+           ,body)))))
+
+(defplace (errno) body
+  (getter setter
+    ^(macrolet ((,getter () '(errno))
+                (,setter (val-expr)
+                   (with-gensyms (val-sym)
+                     ^(slet ((,val-sym ,val-expr))
+                         (progn (errno ,val-sym) ,val-sym)))))
+       ,body)))
+
+(defplace (fun sym) body
+  (getter setter
+    ^(macrolet ((,getter () ^(fun ,',sym))
+                (,setter (val) ^(sys:setqf ,',sym ,val)))
+       ,body))
+  nil
+  (deleter
+    ^(macrolet ((,deleter (:env env)
+                   (when (lexical-fun-p env ',sym)
+                     (compile-error "~s is a lexical function, \
+                                    \ thus not deletable"
+                                    ',sym))
+                    ^(fmakunbound ',',sym)))
+       ,body)))
+
+(defun sys:get-fun-getter-setter (sym)
+  (tree-case sym
+    ((type struct slot)
+      (if (eq type 'meth)
+        (caseql slot
+          (:init (cons (op struct-get-initfun struct)
+                       (op struct-set-initfun struct)))
+          (:postinit (cons (op struct-get-postinitfun struct)
+                           (op struct-set-postinitfun struct)))
+          (t (cons (op static-slot struct slot)
+                   (op static-slot-ensure struct slot))))
+        :))
+    ((type sym)
+      (if (eq type 'macro)
+        (let ((cell (or (gethash sys:top-mb sym)
+                        (sethash sys:top-mb sym (cons sym nil)))))
+          (cons (op cdr)
+                (op sys:rplacd cell)))
+        :))
+    (else
+      (let ((cell (or (gethash sys:top-fb sym)
+                      (sethash sys:top-fb sym (cons sym nil)))))
+        (cons (op cdr)
+              (op sys:rplacd cell))))))
+
+(defplace (symbol-function sym-expr) body
+  (getter setter
+    (with-gensyms (gs-sym)
+      ^(let ((,gs-sym (sys:get-fun-getter-setter ,sym-expr)))
+          (macrolet ((,getter () ^(call (car ,',gs-sym)))
+                     (,setter (val) ^(call (cdr ,',gs-sym) ,val)))
+            ,body))))
+  nil
+  (deleter
+    ^(macrolet ((,deleter () ^(fmakunbound ,',sym-expr)))
+       ,body)))
+
+(defun sys:get-mb (sym)
+  (or (gethash sys:top-mb sym)
+      (compile-error "unbound macro ~s" sym)))
+
+(defplace (symbol-macro sym-expr) body
+  (getter setter
+    (with-gensyms (binding-sym)
+      ^(let ((,binding-sym (sys:get-mb ,sym-expr)))
+          (macrolet ((,getter () ^(cdr ,',binding-sym))
+                     (,setter (val) ^(sys:rplacd ,',binding-sym ,val)))
+            ,body))))
+  nil
+  (deleter
+    ^(macrolet ((,deleter () ^(mmakunbound ,',sym-expr)))
+       ,body)))
+
+(defun sys:get-vb (sym)
+  (or (gethash sys:top-vb sym)
+      (sethash sys:top-vb sym (cons sym nil))))
+
+(defplace (symbol-value sym-expr) body
+  (getter setter
+    (with-gensyms (binding-sym)
+      ^(let ((,binding-sym (sys:get-vb ,sym-expr)))
+          (macrolet ((,getter () ^(cdr ,',binding-sym))
+                     (,setter (val) ^(sys:rplacd ,',binding-sym ,val)))
+            ,body))))
+  nil
+  (deleter
+    ^(macrolet ((,deleter () ^(makunbound ,',sym-expr)))
+       ,body)))
+
+(defplace (slot struct sym) body
+  (getter setter
+    (with-gensyms (struct-sym slot-sym)
+      ^(alet ((,struct-sym ,struct)
+              (,slot-sym ,sym))
+         (macrolet ((,getter () ^(slot ,',struct-sym ,',slot-sym))
+                    (,setter (val) ^(slotset ,',struct-sym ,',slot-sym ,val)))
+           ,body))))
+  (ssetter
+    ^(macrolet ((,ssetter (val) ^(slotset ,',struct ,',sym ,val)))
+      ,body)))
+
+(defmacro define-modify-macro (name lambda-list function)
+  (let ((cleaned-lambda-list (mapcar [iffi consp car]
+                                     (remql : lambda-list))))
+    (with-gensyms (place-sym args-sym)
+      ^(defmacro ,name (:env env ,place-sym ,*lambda-list)
+         (with-update-expander (getter setter) ,place-sym env
+           ^(,setter (,',function (,getter) ,,*cleaned-lambda-list)))))))
+
+(defmacro sys:placelet-1 (((sym place)) :env env . body)
+  (with-gensyms (tmp-place pl-getter pl-setter)
+    (unwind-protect
+      (progn
+        (sethash *place-update-expander* tmp-place
+                 (lambda (tmp-getter tmp-setter tmp-place tmp-body)
+                   ^(macrolet ((,tmp-getter () ^(,',pl-getter))
+                               (,tmp-setter (val) ^(,',pl-setter ,val)))
+                      ,tmp-body)))
+        (call-update-expander pl-getter pl-setter place env
+          ^(macrolet ((,tmp-place () ^(,',pl-getter)))
+             ,(sys:expand ^(symacrolet ((,sym (,tmp-place)))
+                             ,*body) env))))
+      (remhash *place-update-expander* tmp-place))))
+
+(defmacro placelet* (sym-place-pairs . body)
+  (tree-case sym-place-pairs
+    (() ^(progn ,*body))
+    (((sym place)) ^(sys:placelet-1 ((,sym ,place)) ,*body))
+    (((sym place) . rest-pairs) ^(sys:placelet-1 ((,sym ,place))
+                                   (placelet* (,*rest-pairs) ,*body)))
+    (obj (compile-error "~s: bad syntax: ~s" 'placelet* obj))))
+
+(defmacro placelet (sym-place-pairs . body)
+  (unless (all sym-place-pairs
+               [andf consp (opip length (= 2)) (oand first bindable)])
+    (compile-error "~s: bad syntax: ~s" 'placelet sym-place-pairs))
+  (tree-bind (: syms places) (transpose sym-place-pairs)
+     (let ((temps (mapcar (ret (gensym)) syms)))
+       ^(placelet* (,*(zip temps places))
+          (symacrolet (,*(zip syms temps))
+            ,*body)))))
+
+(defun sys:register-simple-accessor (get-fun set-fun)
+  (sethash *place-update-expander* get-fun
+           (lambda (getter setter place body)
+             (let* ((args (cdr place))
+                    (temps (mapcar (ret (gensym)) args)))
+               ^(let (,(zip temps args))
+                  (macrolet ((,getter () ^(,',get-fun ,*',temps))
+                             (,setter (val)
+                               ^(,',set-fun ,*',temps ,val)))
+                    ,body)))))
+  (sethash *place-clobber-expander* get-fun
+           (lambda (ssetter place body)
+             ^(macrolet ((,ssetter (val)
+                               ^(,',set-fun ,*(cdr ',place) ,val)))
+                ,body)))
+  get-fun)
+
+(defmacro define-accessor (get-fun set-fun)
+  ^(sys:register-simple-accessor ',get-fun ',set-fun))
+
+(define-place-macro first (obj) ^(car ,obj))
+(define-place-macro rest (obj) ^(cdr ,obj))
+(define-place-macro second (obj) ^(ref ,obj 1))
+(define-place-macro third (obj) ^(ref ,obj 2))
+(define-place-macro fourth (obj) ^(ref ,obj 3))
+(define-place-macro fifth (obj) ^(ref ,obj 4))
+(define-place-macro sixth (obj) ^(ref ,obj 5))
+(define-place-macro seventh (obj) ^(ref ,obj 6))
+(define-place-macro eighth (obj) ^(ref ,obj 7))
+(define-place-macro ninth (obj) ^(ref ,obj 8))
+(define-place-macro tenth (obj) ^(ref ,obj 9))
+
+(define-place-macro last (obj : (n nil have-n))
+  (cond
+    ((and have-n (constantp n) (not (plusp n)))
+     ^(sub ,obj t t))
+    ((and have-n (constantp n))
+     ^(sub ,obj ,(- n) t))
+    (have-n
+     ^(sub ,obj (- (max ,n 0)) t))
+    (t ^(sub ,obj -1 t))))
+
+(define-place-macro butlast (obj : (n nil have-n))
+  (cond
+    ((and have-n (constantp n) (not (plusp n)))
+     obj)
+    ((and have-n (constantp n))
+     ^(sub ,obj 0 ,(- n)))
+    (have-n
+     ^(sub ,obj 0 (- (max ,n 0))))
+    (t ^(sub ,obj 0 -1))))
+
+(define-place-macro nth (index obj)
+  ^(car (nthcdr ,index ,obj)))

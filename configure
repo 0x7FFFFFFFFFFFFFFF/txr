@@ -1,0 +1,3086 @@
+#!/bin/sh
+#
+# Copyright 2009-2018
+# Kaz Kylheku <kaz@kylheku.com>
+# Vancouver, Canada
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+#
+# The #!/bin/sh might be some legacy piece of crap,
+# not even up to 1990 POSIX.2 spec. So the first step
+# is to look for a better shell in some known places
+# and re-execute ourselves with that interpreter.
+#
+
+if test x$txr_shell = x ; then
+  for shell in /bin/bash /usr/bin/bash /usr/xpg4/bin/sh ; do
+    if test -x $shell ; then
+       txr_shell=$shell
+       break
+    fi
+  done
+  if test x$txr_shell = x ; then
+    echo "No known POSIX shell found: falling back on /bin/sh, which may not work"
+    txr_shell=/bin/sh
+  fi
+  export txr_shell
+  exec $txr_shell $0 ${@+"$@"}
+fi
+
+set -u
+
+#
+# Save command line in a way that can be re-run.
+# This takes care of spaces, but if there are shell-meta characters
+# in the arguments, oops.
+#
+
+cmdline=
+for arg in "$0" ${@+"$@"} ; do
+  [ -n "$cmdline" ] && cmdline="$cmdline "
+  case $arg in
+  *" "* | " "* | *" " )
+    cmdline=$cmdline$(printf "\"%s\"" "$arg")
+    ;;
+  * )
+    cmdline=$cmdline$arg
+    ;;
+  esac
+done
+
+#
+# Establish default values for any variables that are not specified
+# on the command line. The default derivations from prefix are in
+# Make syntax. They go verbatim into the generated config.make.
+# This way they can be overridden more flexibly at make time.
+#
+
+#
+# non-config
+#
+help=
+
+#
+# config
+#
+prefix='/usr/local'
+install_prefix=
+bindir='bin'
+datadir='share/txr'
+mandir='share/man'
+make=
+cross=
+compiler_prefix=
+ccname='$(CC)'
+cc='$(cross)$(compiler_prefix)$(ccname)'
+intptr=
+exe=
+tool_prefix=
+lexname_given=
+lexname=
+lex_given=
+lex='$(cross)$(tool_prefix)$(lexname)'
+yaccname_given=
+yaccname='' # test tries $(YACC) first
+yacc='$(cross)$(tool_prefix)$(yaccname)'
+yacc_given=
+nm='$(cross)$(tool_prefix)nm'
+opt_flags=-O2
+lang_flags='-ansi -D_XOPEN_SOURCE=700 -D_POSIX_C_SOURCE=200112 -D_GNU_SOURCE'
+diag_flags='-Wall -Werror=implicit-function-declaration -Werror=missing-prototypes -Werror=strict-prototypes'
+debug_flags=-g
+debug_only_flags=-DTXR_DEBUG
+debug_also=
+inline=
+platform_cflags=
+remove_flags=
+lex_dbg_flags=
+conf_ldflags=
+platform_ldflags=
+txr_dbg_opts=--gc-debug
+valgrind=
+lit_align=
+extra_debugging=
+debug_support=y
+gen_gc=y
+have_dbl_decimal_dig=
+have_unistd=
+have_sys_types=
+have_sys_time=
+have_makedev=
+have_syslog=
+have_glob=
+have_ftw=
+have_windows_h=
+have_windres=
+have_posix_sigs=
+have_sockets=
+need_darwin_c_source=
+have_git=
+have_pwuid=
+have_grgid=
+have_alloca=
+have_termios=
+have_winsize=
+termios_define=
+have_pkgconfig=
+libffi_cflags=
+
+#
+# Parse configuration variables
+#
+while [ $# -gt 0 ] ; do
+  case $1 in
+  --no-* | --no_* )
+    var=${1#--no?}
+    val=
+    ;;
+  --*=* )
+    var=${1%%=*}
+    var=${var#--}
+    val=${1#*=}
+    ;;
+  --*= )
+    var=${1%%=*}
+    var=${var#--}
+    val=
+    ;; --* )
+    var=${1#--}
+    val=y
+    ;;
+  *=* )
+    var=${1%%=*}
+    val=${1#*=}
+    ;;
+  *= )
+    var=${1%%=*}
+    val=
+    ;;
+  * )
+    printf "$0: '$1' doesn't look like a configuration variable assignment\n"
+    printf "$0: use --help to get help\n"
+    exit 1
+  esac
+
+  var=$(echo "$var" | tr - _)
+
+  if ! echo $var | grep -q -E '^[A-Za-z_][A-Za-z0-9_]*$' ; then
+    printf "$0: '$var' isn't a proper configuration variable name\n"
+    exit 1
+  fi
+
+  eval "var_exists=\${$var+y}"
+
+  if [ "$var_exists" != y ] ; then
+    printf "$0: nonexistent option: '%s'\n" "$1"
+    exit 1
+  fi
+
+  eval "$var='$val'"
+
+  eval "var_given_exists=\${${var}_given+y}"
+
+  if [ "$var_given_exists" = y ] ; then
+    eval "${var}_given=y"
+  fi
+
+  shift
+done
+
+#
+# If --help was given (or --help=<nonempty> or help=<nonempty>) then
+# print help and exit. The termination status is failed, to indicate
+# that configuration was not done.
+#
+
+if [ -n "$help" ] ; then
+cat <<!
+
+usage: $0 { variable=value }*
+
+The configure script prepares txr program for compilation and installation.
+To configure a program means to establish the values of make variables
+which influence how the software is built, where it is installed.
+These variables can also influence what features are present in the
+software, and can determine various defaults for those behaviors which are
+dynamically configurable when the software is run.
+
+Configuration variables are recorded in a file called config.make.
+This is a GNU makefile, and consequently uses the GNU make syntax. It is
+included in the main Makefile by an include statement.
+
+The configure script is flexible. It allows variables to be entered in any
+of these forms:
+
+Canonical:
+
+   variable=value      Defines the given variable as having the given value.
+   variable=           Defines the variable as having an empty value.
+                       An empty value serves as boolean false.
+
+Long-option style:
+
+   --variable=value    Same as 'variable=value', but resembles a GNU-style
+                       long option.
+   --variable          Same as 'variable=y'.
+   --no-variable       Same as 'variable='.
+
+No variables are required. The configure script establishes default values
+for any variables which are needed by the build, but which are not specified
+on the command line.
+
+After running $0, check that the config.make contents are sane.
+
+The following variables are supported.  Note that make variable syntax may
+be used in paths. Default values are shown in [square brackets].
+
+Variables are case-sensitive, but underscores and dashes are interchangeable.
+
+prefix [$prefix]
+
+  Specifies root directory where the software will ultimately be installed and
+  run from.
+
+install-prefix [$install_prefix]
+
+  Specifies an extra path prefix that will be prepended to all paths during
+  installation, which allows the software to be installed in a temporary
+  directory for packaging. This variable becomes the \$(DESTDIR)
+  variable in the config.make makefile.
+
+bindir [$bindir]
+
+  Specifies where the program executable will be installed, as a relative
+  path from the prefix.
+
+datadir [$datadir]
+
+  Specifies where read-only program data is to be stored, as a relative
+  path from the prefix.
+
+mandir [$mandir]
+
+  Specifies the directory where to install man pages, as a relative
+  path from the prefix.
+
+cross [$cross]
+
+  Specifies the root of a cross-compiling toolchain.
+  This becomes the \$(cross) variable in the config.make makefile, and by
+  default will be added as a prefix to all of the toolchain commands.
+  It should include the trailing slash, unless the \$compiler_prefix
+  and \$tool_prefix variables take care of this by providing a leading slash.
+
+compiler-prefix [$compiler_prefix]
+
+  Specifies a prefix to be added to the compiler command.
+  This is added to the \$(cross) prefix. This can include some path name
+  components, and a name fragment. For instance, if
+  \$cross is "/cross/toolchain/" and \$compiler_prefix is
+  "bin/mips-linux-" then the compiler command, unless otherwise
+  specified, will be "/cross/toolchain/bin/mips-linux-gcc".
+
+ccname [$ccname]
+
+  Specifies just the name of the compiler front-end program, without the path.
+  The following variable, cc, specifies the full name.
+
+cc [$cc]
+
+  Specifies the name of the toolchain front-end driver command to use for
+  compiling C sources to object files, and for linking object files to
+  executables. This becomes the TXR_CC variable in config.make.
+
+intptr [$intptr]
+
+  Specifies the name of the C integer type wide enough such that a pointer
+  value can be converted to it. If this is blank, the configure script
+  will try to auto detect it.
+
+lit-align [$lit_align]
+
+  Specifies alignment for wide string literals.  This is guessed
+  from the size of the wchar_t type. If your wchar_t type is two byte wide, but
+  wide literals are aligned to four bytes, then you should specify this.  This
+  will eliminate some kludges in the program. There is no easy way to check
+  for this withut generating and running a C program, which is unfriendly
+  for cross-compiling!
+
+inline [$inline]
+
+  Specifies the syntax for defining an inline function, in such
+  a way that the function definition can be included into multiple
+  translation units without clashes.
+
+  If blank, an attempt is made to auto-detect this which
+  falls back on "static".
+
+tool-prefix [$tool_prefix]
+
+  Specifies a prefix to be added to tool commands other than the
+  compiler, like lex and yacc, in addition to \$cross.
+
+lexname [$lexname]
+
+  Specifies just the name of the lex program without the path.
+  The following variable, lex, specifies the full name.
+  If blank, the choice lex program will be auto-detected.
+
+lex [$lex]
+
+  Specifies the program to use for compiling lex scanners to C.
+  This must be compatible with GNU flex, since flex extensions are used.
+
+yaccname [$yaccname]
+
+  Specifies just the name of the yacc program without the path.
+  The following variable, yacc, specifies the full name.
+  If blank, the choice yacc program will be auto-detected.
+
+yacc [$yacc]
+
+  Specifies the program to use for compiling yacc scanners to C.
+
+nm [$nm]
+
+  Specifies the nm program for dumping symbols from an object file.
+
+opt-flags [$opt_flags]
+
+  Specifies optimization flags to use for compiling and linking
+  C sources.
+
+lang-flags [$lang_flags]
+
+  Specifies compiler flags which control the C language dialect and standard
+  conformance in the language and header files. The txr program is written
+  in C90, and requires POSIX and possibly other extensions.
+
+diag-flags [$diag_flags]
+
+  Specifies compiler flags for obtaining extra diagnostics.
+
+debug-flags [$debug_flags]
+
+  Specifies flags for requesting that debugging information be
+  retained in the compile and link. These flags are applied
+  to optimized and debugging targets.
+
+debug-only-flags [$debug_only_flags]
+
+  Specifies compiler flags which only apply to debugging
+  targets.
+
+debug-also [$debug_also]
+
+  Specifies that a debugging version of TXR is to be built at the
+  same time. This means that "make" will always update two sets
+  of object files compiled with different optimization flags,
+  and produce two binaries: txr and txr-dbg.
+
+platform-cflags [$platform_cflags]
+
+  Specify additional compiler flags for anything else, such as CPU tuning,
+  target ABI selection, code generation options, et cetera.
+
+platform-ldflags [$platform_ldflags]
+
+  Specify additional linker flags for anything else, such as hardening,
+  linking as needed, et cetera.
+
+remove-flags [$remove_flags]
+
+  This is a negative otpion. Any flags mentioned in this variable
+  will be removed from any of the other compiler flags options above.
+  The flags may contain GNU Make patterns.
+
+lex-dbg-flags [$lex_dbg_flags]
+
+  Specifies debug flags to be passed to lex, perhaps to generate a debugging
+  scanner.
+
+txr-dbg-opts [$txr_dbg_opts]
+
+  Specifies debug flags to pass to the txr program during the execution
+  of "make tests".
+
+valgrind [$valgrind]
+
+  Use --valgrind to to build txr with valgrind integration.
+  Valgrind integration means that when the program is running under valgrind,
+  it advises valgrind about stack memory locations accessed by the garbage
+  collector, to suppress diagnostics about uninitialized accesses.
+
+extra-debugging [$extra_debugging]
+
+  Use --extra_debugging to configure some additional debugging features,
+  which incur a run-time penalty.
+
+gen-gc [$gen_gc]
+
+  Use --no-gen-gc to disable the generational garbage collector which
+  is now enabled by default.
+
+  When disabled, the garbage collector performs a full object traversal and
+  sweep on each garbage collection.
+
+!
+  exit 1
+fi
+
+#
+# Variables are read, --help wasn't given, so let's configure!
+#
+
+
+txr_ver=198
+
+#
+# The all important banner.
+#
+
+if [ $txr_ver ] ; then
+  banner_text=$(printf " Configuring txr %s " "$txr_ver")
+else
+  banner_text=" Configuring txr (unknown version) "
+fi
+banner_box=$(printf "%.${#banner_text}s\n" \
+             "-------------------------------------------")
+printf "+%s+\n|%s|\n+%s+\n" $banner_box "$banner_text" $banner_box
+
+#
+# From here on in, we bail if any command fails.
+#
+
+set -e
+
+printf "We are using this shell: %s\n" $txr_shell
+
+#
+# Check for GNU make
+#
+
+printf "Checking for GNU Make ... "
+
+if [ -z "$make" ] ; then
+  for make in make gmake ; do
+    output=$($make --version 2> /dev/null) || true
+    set -- $output
+
+    if [ $# -lt 2 ] || [ $1 != "GNU" -o $2 != "Make" ] ; then
+      continue
+    fi
+    break
+  done
+fi
+
+if [ -z "$make" ] ; then
+  printf "missing\n"
+  exit 1
+fi
+
+make_version=$3
+
+save_ifs=$IFS ; IFS=. ; set -- $make_version ; IFS=$save_ifs
+
+if [ $1 -lt 3 -o \( $1 -eq 3 -a $2 -lt 81 \) ] ; then
+  printf "too old (%s found, 3.81 or newer needed)\n" $make_version
+  exit 1
+else
+  printf "yes (%s found)\n" $make_version
+fi
+
+#
+# Verify sanity of --prefix and other directories.
+#
+
+printf "Checking installation paths:\n"
+
+for name in bindir datadir mandir; do
+  eval path="\$install_prefix\$prefix/\${$name}"
+  printf "\$(install_prefix)\$(prefix)/\$%s=%s ... " $name "$path"
+  test_access=y
+  case "$path" in
+  " "* | *" "* | *" " )
+    printf "incorrect (contains spaces)\n"
+    exit 1
+    ;;
+  -* )
+    printf "incorrect (resembles a command option)\n"
+    exit 1
+    ;;
+  *'$('* )
+    # It's a make expression; can't test it
+    test_access=
+    ;;
+  /* )
+    ;;
+  * )
+    printf "incorrect (must be absolute path)\n"
+    exit 1
+    ;;
+  esac
+
+  if [ $test_access ] ; then
+    test_prefix=$path
+
+    while true ; do
+      if [ -e $test_prefix ] ; then
+      if [ ! -d $test_prefix ] ; then
+        printf "incorrect ('%s' is not a directory)!\n" $test_prefix
+        exit 1
+      fi
+      if [ ! -w $test_prefix ] ; then
+        printf "okay\n  (but no write access to '%s'\n" $test_prefix
+
+        printf "   so '$make install' will require root privileges)\n"
+      else
+        printf "okay\n"
+      fi
+      break
+      fi
+      test_prefix=$(dirname $test_prefix)
+    done
+  else
+    printf "okay\n  (make variable derivation)\n"
+  fi
+done
+
+#
+# First, we have to figure out whether we are configured straight
+# in the source directory, or whether we are in a separate build directory.
+# In the latter case, we set up a symbolic link to the Makefile.
+#
+source_dir="$(dirname $0)"
+
+#
+# If building in a separate directory, establish top_srcdir as
+# an absolute path to the source directory, with a trailing slash.
+# Otherwise top_srcdir is blank.
+#
+
+if [ "$source_dir" = "." ] ; then
+  top_srcdir=""
+else
+  top_srcdir="$(cd "$source_dir" ; pwd -P)"/
+fi
+
+printf "Checking source directory \"%s\" ..." "$top_srcdir"
+
+lndir()
+{
+  fromdir=$1
+  todir=${2%/}
+  abs=${fromdir%${fromdir#/}}
+
+  find "$fromdir" \( -type f -o -type d \) | while read frompath ; do
+    topath=${frompath#$fromdir}
+    topath=${topath#/}
+    [ -n "$topath" ] || topath="."
+    if [ -f "$frompath" ] ; then
+      if [ $abs ] ; then
+        ln -sf "$frompath" "$todir/$topath"
+      else
+        old_IFS=$IFS
+        IFS=/
+        set -- $todir/$topath
+        IFS=$old_IFS
+        dots=""
+        while [ $# -gt 0 ] ; do
+          [ $1 = "." ] || dots="$dots../"
+          shift
+        done
+        rm -f "$todir/$topath"
+        ln -sf "$dots$frompath" "$todir/$topath"
+      fi
+    else
+      mkdir -p "$todir/$topath"
+    fi
+  done
+}
+
+case "$top_srcdir" in
+" "* | *" "* | *" " )
+  printf " bad (contains spaces)\n"
+  exit 1
+  ;;
+* )
+  printf " okay\n"
+  ;;
+esac
+
+if [ "$source_dir" != "." ] ; then
+  for x in Makefile ; do
+    printf "Symlinking %s -> $source_dir/%s\n" $x $x
+    ln -sf "$source_dir/$x" .
+  done
+  for x in share tests; do
+    printf "Tree symlinking %s -> $source_dir/%s\n" $x $x
+    lndir $source_dir/$x $x
+  done
+else
+  printf "** Note: it's recommended to build in a separate directory\n"
+fi
+
+gen_config_make()
+{
+  cat > config.make <<!
+#
+# Make include file automatically generated by $0.
+# Changes to this file are lost when the above is re-run.
+#
+
+# Shell used by make for running recipes; this
+# is the as the shell we chose for the configure script,
+# derived from the txr_shell variable.
+SHELL := $txr_shell
+
+txr_ver := $txr_ver
+
+# absolute path to source code directory
+top_srcdir := $top_srcdir
+
+# ultimate installation prefix, where the
+# application will be run.
+prefix := $prefix
+
+# packaging installation prefix, where the
+# application may be temporarily installed
+# for creating pre-compiled packages,
+# e.g. for an operating system distro.
+DESTDIR := $install_prefix
+
+# relative path from prefix to datadir
+bindir_rel := $bindir
+
+# executable directory
+bindir = \$(prefix)/\$(bindir_rel)
+
+# read-only data directory
+datadir = \$(prefix)/$datadir
+
+# man page directory
+mandir = \$(prefix)/$mandir
+
+# cross compiler toolchain root directory
+cross := $cross
+
+# compiler name
+ccname = $ccname
+
+# name of lex program
+lexname = $lexname
+
+# name of yacc program
+yaccname = $yaccname
+
+# prefix for compiler command
+compiler_prefix := $compiler_prefix
+
+# prefix for non-compiler toolchain commands
+tool_prefix := $tool_prefix
+
+# do we compile in syslog support?
+have_syslog := $have_syslog
+
+# do we compile in glob support?
+have_glob := $have_glob
+
+# do we compile in ftwsupport?
+have_ftw := $have_ftw
+
+# do we modern posix signal handling?
+have_posix_sigs := $have_posix_sigs
+
+have_sockets := $have_sockets
+have_termios := $have_termios
+termios_define := $termios_define
+
+# do we compile in debug support?
+debug_support := $debug_support
+
+# EXE suffix
+EXE := $exe
+
+have_git := $have_git
+
+add_win_res := $([ -n "$have_windows_h" -a -n "$have_windres" ] && echo "y")
+
+TXR_CC := $cc
+TXR_LEX := $lex
+TXR_YACC := $yacc
+TXR_NM := $nm
+
+PROG := txr
+
+OPT_FLAGS := $opt_flags
+LANG_FLAGS := $lang_flags
+DIAG_FLAGS := $diag_flags
+DBG_FLAGS := $debug_flags
+DBG_ONLY_FLAGS := $debug_only_flags
+BUILD_TARGETS := $(if [ $debug_also ] ; then
+                     echo '$(PROG) $(PROG)-dbg'
+                   else
+                     echo '$(PROG)'; fi)
+PLATFORM_CFLAGS := $platform_cflags
+PLATFORM_LDFLAGS := $platform_ldflags
+CONF_LDFLAGS := $conf_ldflags
+REMOVE_FLAGS := $remove_flags
+LEX_DBG_FLAGS := $lex_dbg_flags
+TXR_DBG_OPTS := $txr_dbg_opts
+
+LIBFFI_CFLAGS := $libffi_cflags
+!
+}
+
+#
+# Before doing some other tests, we need a config.make
+#
+
+printf "Generating config.make ... "
+gen_config_make
+printf "\n"
+
+#
+# Start config.h header
+#
+
+cat <<! > config.h
+/*
+ * Header file automatically generated by $0.
+ * Tweaking this file may seem like a good temporary workaround
+ * to some problem but you probably should fix the script
+ * to do the job. In any case, be aware that you will lose your
+ * changes if you re-run $0.
+ */
+!
+
+#
+# Perform a configure test.
+# Arguments are passed through to make
+#
+conftest()
+{
+  rm -f ${exe-"conftest conftest.exe"} ${exe+"conftest$exe"}
+  $make conftest ${@+"$@"} > conftest.err 2>&1 && [ -x conftest ] 
+}
+
+#
+# Like conftest but make only .o
+#
+conftest_o()
+{
+  rm -f conftest.o
+  $make conftest.o ${@+"$@"} > conftest.err 2>&1
+}
+
+#
+# Like conftest but make conftest.syms
+#
+conftest_syms()
+{
+  rm -f conftest.o conftest.syms
+  $make conftest.syms ${@+"$@"} > conftest.err 2>&1
+}
+
+#
+# Check for git because we use it out of the Makefile
+# But this is pointless if we have no git repo.
+# "have_git" means we have a repo, and git.
+#
+if [ -d $top_srcdir.git ] ; then 
+  printf "Checking whether we have git ... "
+
+  if git --version > /dev/null 2> /dev/null ; then
+    have_git=y
+    printf "yes\n"
+  else
+    printf "missing\n"
+  fi
+fi
+
+#
+# Check C compiler sanity
+#
+printf "Checking whether your C compiler can make a simple executable ... "
+
+cat > conftest.c <<!
+#include <stdio.h>
+int main(void)
+{
+  printf("Hello, world!\n");
+  return 0;
+}
+!
+
+if ! conftest ; then
+  printf "failed\n"
+  printf "Checking whether the failure is due to a requirement to use C99 ... "
+  if conftest EXTRA_FLAGS=-std=c99 ; then
+    printf "yes\n"
+    lang_flags="$(echo "$lang_flags" | sed -e 's/-ansi/-std=c99/')"
+  else
+    printf "no\n\n"
+    conftest && true
+    printf "Errors from compilation: \n\n"
+    cat conftest.err
+    exit 1
+  fi
+else
+  printf "okay\n"
+fi
+
+printf "Checking whether executables have that idiotic .exe suffix ... "
+
+if ls conftest.exe > /dev/null 2>&1 ; then
+  echo "yes"
+  exe=.exe
+else
+  echo "no"
+fi
+
+rm -f conftest$exe
+
+#
+# Check for annoying clashes from non-conforming BSD-derived systems that don't
+# honor Unix/POSIX feature selection macros!
+#
+
+printf "Checking for name clashes caused by nonconforming toolchains ... "
+
+for ident in trunc floorf random longlong_t ; do
+  cat > conftest.c <<!
+#include <assert.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <float.h>
+#include <limits.h>
+#include <math.h>
+#include <setjmp.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#include <wchar.h>
+#include <wctype.h>
+
+struct txr_foo { int txr; } $ident;
+
+int $ident(void);
+
+int main(void) { return 0; }
+!
+  if ! conftest ; then
+    printf "#define %s txr_%s\n" $ident $ident >> config.h
+    have_unistd=y
+  fi
+done
+
+printf "done\n"
+
+#
+# Check for idiotic behavior: extensions in C header files controlled
+# by __STRICT_ANSI__ rather than things like __POSIX_SOURCE.
+#
+
+printf "Checking for proper support for feature-test macros ... "
+
+cat > conftest.c <<!
+#include <stdio.h>
+
+int main(void)
+{
+   return fileno(stdin);
+}
+!
+if conftest EXTRA_FLAGS=-Werror ; then
+  printf "yes\n"
+else
+  printf "no\n"
+  lang_flags="$lang_flags -U__STRICT_ANSI__"
+  printf "Regenerating config.make ..."
+  gen_config_make
+  printf "done\n"
+fi
+
+#
+# Detect Apple environment. We need _DARWIN_C_SOURCE.
+#
+
+printf "Checking for Apple environment ... "
+if [ "$(make conftest.darwin)" = "yes" ] ; then
+  printf "yes\n"
+  need_darwin_c_source=y
+  lang_flags="$lang_flags -D_DARWIN_C_SOURCE"
+  printf "Regenerating config.make ..."
+  gen_config_make
+  printf "done\n"
+else
+  printf "no\n"
+fi
+
+#
+# Detect stupid FreeBSD problem: no defined way to reveal
+# traditional BSD functions if Unix compliance is selected with
+# _XOPEN_SOURCE. Heaven help these troglodytes.
+#
+
+printf "Detecting what symbol reveals BSD functions ... "
+
+cat > conftest.c <<!
+#include <unistd.h>
+#include <stdlib.h>
+
+int main(int argc, char **argv)
+{
+  int (*pdaemon)(int, int) = &daemon;
+}
+!
+
+if conftest ; then
+  printf "none needed\n"
+else
+  for flag in _DEFAULT_SOURCE _BSD_SOURCE __BSD_VISIBLE _GNU_SOURCE _X_OOPS; do
+    if [ $flag = _X_OOPS ] ; then
+      printf "failed\n"
+      break
+    fi
+    
+    if conftest EXTRA_FLAGS=-D$flag ; then
+      printf "%s\n" $flag 
+      lang_flags="$lang_flags -D$flag"
+      gen_config_make
+      break
+    fi
+  done
+fi
+
+#
+# Check for annoying warnings from ctype.h macros
+#
+
+printf "Checking for annoying warnings from <ctype.h> macros ... "
+
+cat > conftest.c <<!
+#include <ctype.h>
+
+int main(void)
+{
+  char x = '3';
+  return isdigit(x);
+}
+!
+if conftest EXTRA_FLAGS=-Werror ; then
+  printf "absent\n"
+else
+  printf "present\n"
+  cat >> config.h <<!
+$(for x in isalpha isupper islower isdigit isxdigit isalnum isspace \
+           ispunct isprint isgraph iscntrl isblank ; do \
+    printf "#undef %s\n" $x ; done)
+!
+fi
+
+#
+# Check what kind of C type we have for integers wider than long,
+# if any.
+#
+printf "Checking what C type we have for integers wider than \"long\" ... "
+
+longlong=
+
+for try_type in int64 __int64 "long long" ; do
+  cat > conftest.c <<!
+$try_type value;
+!
+  if conftest_o ; then
+    longlong=$try_type
+    break
+  fi
+done
+
+if [ -n "$longlong" ] ; then
+  printf '"%s"\n' "$longlong"
+  printf "#define HAVE_LONGLONG_T 1\n" >> config.h
+  printf "typedef $longlong longlong_t;\n" >> config.h
+else
+  printf "none\n"
+fi
+
+printf "Checking what C type we have for unsigned integers wider than \"long\" ... "
+
+ulonglong=
+
+for try_type in uint64 __uint64 "unsigned long long" ; do
+  cat > conftest.c <<!
+$try_type value;
+!
+  if conftest_o; then
+    ulonglong=$try_type
+    break
+  fi
+done
+
+if [ -n "$ulonglong" ] ; then
+  printf '"%s"\n' "$ulonglong"
+  printf "#define HAVE_ULONGLONG_T 1\n" >> config.h
+  printf "typedef $ulonglong ulonglong_t;\n" >> config.h
+else
+  printf "none\n"
+fi
+
+printf "Checking what C type we have for integers wider than \"long long\" ... "
+
+broken128=
+output=$($make conftest.ccver)
+set -- $output
+if [ "$1" = "gcc" ] ; then
+  gcc_version=$3
+  save_ifs=$IFS ; IFS=. ; set -- $gcc_version ; IFS=$save_ifs
+  if [ $1 -lt 4 ] || [ $1 -eq 4 -a $2 -le 3 ] ; then
+    broken128=y
+  fi
+fi
+
+superlong=
+
+if [ -z "$broken128" ] ; then
+  for try_type in int128 int128_t __int128 __int128_t ; do
+    cat > conftest.c <<!
+#include "config.h"
+int main(void)
+{
+   extern longlong_t a, b;
+   $try_type value = ($try_type) a * ($try_type) b;
+   return 0;
+}
+longlong_t a, b;
+!
+    if conftest_o ; then
+      superlong=$try_type
+      break
+    fi
+  done
+fi
+
+if [ -n "$superlong" ] ; then
+  printf '"%s"\n' "$superlong"
+  printf "#define HAVE_SUPERLONG_T 1\n" >> config.h
+  printf "typedef $superlong superlong_t;\n" >> config.h
+else
+  printf "none\n"
+fi
+
+printf "Checking what C type we have for u. integers wider than \"long long\" ... "
+
+usuperlong=
+
+if [ -z "$broken128" ] ; then
+  for try_type in uint128 uint128_t __uint128 __uint128_t ; do
+    cat > conftest.c <<!
+#include "config.h"
+int main(void)
+{
+   extern longlong_t a, b;
+   $try_type value = ($try_type) a * ($try_type) b;
+   return 0;
+}
+longlong_t a, b;
+!
+    if conftest_o ; then
+      usuperlong=$try_type
+      break
+    fi
+  done
+fi
+
+if [ -n "$usuperlong" ] ; then
+  printf '"%s"\n' "$usuperlong"
+  printf "#define HAVE_USUPERLONG_T 1\n" >> config.h
+  printf "typedef $usuperlong usuperlong_t;\n" >> config.h
+else
+  printf "none\n"
+fi
+
+printf "Checking what C integer type can hold a pointer ... "
+
+read_syms()
+{
+  print_into_config=${1-} 
+  deferred_offset=
+
+  while read symbol type offset size ; do
+    size=$(( 0$size + 0 ))
+    offset=$(( 0$offset + 0 ))
+    symbol=${symbol#_}
+    case "$type" in
+    C )
+      size=$(( offset + 0 ))
+      ;;
+    S )
+      if [ -n "$deferred_offset" ] ; then
+        size=$(( offset - deferred_offset ))
+        case "$deferred_sym" in
+        SIZEOF* )
+          eval $(printf "%s=%d\n" "$deferred_sym" "$size")
+            if [ -n "$print_into_config" ] ; then
+              printf "#define %s %s\n" "$deferred_sym" "$size" >> config.h
+            fi
+          ;;
+        esac
+      fi
+      deferred_sym=$symbol
+      deferred_offset=$offset
+      continue
+      ;;
+    esac
+    case "$symbol" in
+    SIZEOF* )
+      eval $(printf "%s=%d\n" "$symbol" "$size")
+      if [ -n "$print_into_config" ] ; then
+        printf "#define %s %s\n" "$symbol" "$size" >> config.h
+      fi
+      ;;
+    esac
+  done < conftest.syms
+}
+
+if [ -z "$intptr" ] ; then
+  cat > conftest.c <<!
+#include <stddef.h>
+#include "config.h"
+#ifdef HAVE_SUPERLONG_T
+char SIZEOF_SUPERLONG_T[sizeof (superlong_t)];
+#endif
+#ifdef HAVE_LONGLONG_T
+char SIZEOF_LONGLONG_T[sizeof (longlong_t)];
+#endif
+char SIZEOF_PTR[sizeof (char *)];
+char SIZEOF_LONG[sizeof (long)];
+char SIZEOF_INT[sizeof (int)];
+char SIZEOF_SHORT[sizeof (short)];
+char SIZEOF_WCHAR_T[sizeof (wchar_t)];
+char DUMMY;
+!
+  if ! conftest_syms ; then
+    printf "failed\n\n"
+
+    printf "Errors from compilation: \n\n"
+    cat conftest.err
+    exit 1
+  fi
+
+  SIZEOF_PTR=0
+  SIZEOF_SHORT=0
+  SIZEOF_INT=0
+  SIZEOF_LONG=0
+  SIZEOF_LONGLONG_T=0
+  SIZEOF_SUPERLONG_T=0
+
+  read_syms y
+
+  if [ $SIZEOF_PTR -eq 0 ] ; then
+    printf "failed\n"
+    exit 1
+  fi
+
+  if [ $SIZEOF_PTR -eq $SIZEOF_SHORT ] ; then
+    intptr="short"
+    uintptr=y
+  elif [ $SIZEOF_PTR -eq $SIZEOF_INT ] ; then
+    intptr="int"
+    uintptr=y
+  elif [ $SIZEOF_PTR -eq $SIZEOF_LONG ] ; then
+    intptr="long"
+    uintptr=y
+  elif [ $SIZEOF_PTR -eq $SIZEOF_LONGLONG_T ] ; then
+    intptr="longlong_t"
+    uintptr=$ulonglong
+  fi
+
+  if [ -z "$intptr" ] ; then
+    printf "failed\n"
+    exit 1
+  fi
+fi
+
+printf '"%s"\n' "$intptr"
+printf "typedef $intptr int_ptr_t;\n" >> config.h
+if [ -n "$uintptr" ] ; then
+  printf "#define HAVE_UINTPTR_T 1\n" >> config.h
+  printf "typedef unsigned $intptr uint_ptr_t;\n" >> config.h
+fi
+intptr_max_expr="((((convert($intptr, 1) << $((SIZEOF_PTR * 8 - 2))) - 1) << 1) + 1)"
+printf "#define INT_PTR_MAX %s\n" "$intptr_max_expr" >> config.h
+printf "#define INT_PTR_MIN (-INT_PTR_MAX)\n" >> config.h
+
+if [ -n "$longlong" ] && [ $SIZEOF_LONGLONG_T -eq $(( 2 * SIZEOF_PTR )) ]
+then
+  printf "#define HAVE_DOUBLE_INTPTR_T 1\n" >> config.h
+  printf "typedef longlong_t double_intptr_t;\n" >> config.h
+elif [ -n "$superlong" ] && [ $SIZEOF_SUPERLONG_T -eq $(( 2 * SIZEOF_PTR )) ]
+then
+  printf "#define HAVE_DOUBLE_INTPTR_T 1\n" >> config.h
+  printf "typedef superlong_t double_intptr_t;\n" >> config.h
+fi
+
+#if HAVE_LONGLONG_T && 
+
+#
+# Alignment of wchar_t
+#
+# What we really want to know is the alignment of wide string literals
+# like L"wide literal".
+#
+# We make pessimistic assumption that the size of the wchar_t type is this
+# alignment.
+#
+# There is no easy way to get the information without running a compiled
+# program.
+#
+
+printf "Conservatively guessing the alignment of wide literals ... "
+
+if [ -z "$lit_align" ] ; then
+  if [ $SIZEOF_WCHAR_T -eq 0 ] ; then
+    printf "failed\n"
+    exit 1
+  fi
+
+  if [ -n "$need_darwin_c_source" ] ; then
+    lit_align=2
+  else
+    lit_align=$SIZEOF_WCHAR_T
+  fi
+fi
+
+printf "%d\n" "$lit_align"
+printf "#define LIT_ALIGN %d\n" "$lit_align" >> config.h
+
+#
+# Endianness.
+#
+
+printf "Checking target machine endianness ... "
+cat > conftest.c <<!
+#define USPELL(C0, C1, C2, C3) \
+  ((unsigned) C0 << 24 | \
+   (unsigned) C1 << 16 | \
+   (unsigned) C2 << 8 | (unsigned) C3)
+
+unsigned x[6] = {
+  0,
+  USPELL('L', 'I', 'S', 'P'),
+  USPELL('U', 'N', 'I', 'X'),
+  USPELL('C', 'O', 'R', 'E'),
+  USPELL('D', 'W', 'I', 'M'),
+  0
+};
+!
+
+if ! conftest_o ; then
+  printf "failed\n";
+  exit 1;
+else
+  if grep -q 'PSILXINUEROCMIWD' conftest.o ; then
+    printf "little\n";
+    printf "#define HAVE_LITTLE_ENDIAN 1\n" >> config.h
+  elif grep -q 'LISPUNIXCOREDWIM' conftest.o ; then
+    printf "big\n";
+    printf "#define HAVE_LITTLE_ENDIAN 0\n" >> config.h
+  else
+    printf "failed\n"
+    exit 1
+  fi
+fi
+
+#
+# Inline functions
+# 
+
+printf "Checking how to declare inline functions ... "
+
+if [ -z "$inline" ] ; then
+  for inline in \
+    "inline" "static inline" "extern inline" \
+    "__inline__" "static __inline__" "extern __inline__" \
+    "static"
+  do
+    cat > conftest1.c <<!
+$inline int func(void)
+{
+  return 0;
+}
+
+int main(void)
+{
+  return func();
+}
+!
+    cat > conftest2.c <<!
+$inline int func(void)
+{
+  return 0;
+}
+!
+    rm -f conftest2$exe
+    if ! $make conftest2 > conftest.err 2>&1 || ! [ -x conftest2 ] ; then
+      continue
+    fi
+    break
+  done
+fi
+
+printf '"%s"\n' "$inline"
+printf "#define INLINE $inline\n" >> config.h
+
+#
+# DBL_DECIMAL_DIG
+#
+
+printf "Checking for DBL_DECIMAL_DIG ... "
+
+for try_sym in DBL_DECIMAL_DIG __DBL_DECIMAL_DIG__ ; do
+  cat > conftest.c <<!
+#include <float.h>
+
+#ifndef $try_sym
+#error $try_sym not defined
+#else
+int main(void)
+{
+  return 0;
+}
+#endif
+!
+  if conftest ; then
+    printf "yes (%s)\n" $try_sym
+    printf "#define FLO_MAX_DIG $try_sym\n" >> config.h
+    have_dbl_decimal_dig=y
+  fi
+done
+
+if ! [ $have_dbl_decimal_dig ] ; then
+    printf "no\n"
+    printf "#define FLO_MAX_DIG (DBL_DIG + 2)\n" >> config.h
+fi
+
+#
+# Valgrind
+#
+
+if [ -n "$valgrind" ] ; then
+  printf "Checking valgrind API availability ... "
+
+  cat > conftest.c <<!
+#include <valgrind/memcheck.h>
+
+#ifdef VALGRIND_DO_CLIENT_REQUEST
+
+int main(void)
+{
+  return 0;
+}
+
+#else
+syntax error
+#endif
+!
+  if ! conftest ; then
+    printf "failed\n\n"
+    printf "Errors from compilation: \n\n"
+    cat conftest.err
+    exit 1
+  fi
+
+  printf "okay\n"
+  printf "#define HAVE_VALGRIND 1\n" >> config.h
+fi
+
+#
+# Lex and Yacc tests
+#
+
+printf "Checking for lex ... "
+
+if [ -z "$lex_given" -a -z "$lexname_given" ] ; then
+  for lexname in '$(LEX)' "lex" "flex" "" ; do
+    rm -f lex.yy.c
+    if make lexname="$lexname" lex.yy.c > /dev/null 2>&1; then
+      break;
+    fi
+  done
+  if [ -z "$lexname" ] ; then
+    printf "not found\n"
+    exit 1
+  fi
+else
+  rm -f lex.yy.c
+  if ! make lexname="$lexname" lex.yy.c > /dev/null 2>&1; then
+    printf "error\n\n"
+    printf 'values --lexname="%s" --lex="%s" are not working\n\n' "$lexname" "$lex"
+    printf 'A GNU Flex compatible lex is required\n\n'
+    exit 1
+  fi
+fi
+
+rm -f lex.yy.c
+
+printf '"%s"\n' "$lexname"
+
+printf "Checking for yacc program ... "
+
+if [ -z "$yacc_given" -a -z "$yaccname_given" ] ; then
+  rm -f conftest.yacc
+  for yaccname in '$(YACC)' "yacc" "byacc" "bison -y" "" ; do
+    yaccpath=$($make yaccname="$yaccname" conftest.yacc)
+    if command -v $yaccpath > /dev/null ; then
+      break;
+    fi
+  done
+
+  if [ -z "$yaccname" ] ; then
+    printf "not found\n"
+    exit 1
+  fi
+
+  printf '"%s" (path "%s")\n' "$yaccname" "$yaccpath"
+else
+  yaccpath=$($make conftest.yacc)
+  case $yaccpath in
+  *bison )
+    printf "error\n\n"
+    printf "GNU Bison needs -y to behave like yacc\n\n"
+    printf "This needs to be specified in the --yaccname or --yacc option\n\n"
+    exit 1
+    ;;
+  * )
+    if ! command -v $yaccpath > /dev/null ; then
+      printf "not found\n\n"
+      exit 1
+    fi
+    printf "given\n"
+    ;;
+  esac
+fi
+
+#
+# sys/wait.h
+#
+
+printf "Checking whether we have <sys/wait.h> ... "
+
+cat > conftest.c <<!
+#include <sys/wait.h>
+
+int main(void)
+{
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_SYS_WAIT 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+#
+# sys/stat.h
+#
+
+printf "Checking whether we have <sys/stat.h> ... "
+
+cat > conftest.c <<!
+#include <sys/stat.h>
+
+struct stat s;
+
+int main(void)
+{
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_SYS_STAT 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+
+#
+# environ
+#
+
+printf "Checking whether we have environ ... "
+
+cat > conftest.c <<!
+#include <stdio.h>
+
+int main(void)
+{
+  extern char **environ;
+  puts(environ[0]);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_ENVIRON 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+#
+# GetEnvironmentStrings
+#
+
+printf "Checking whether we have GetEnvironmentStrings ... "
+
+cat > conftest.c <<!
+#include <windows.h>
+
+int main(void)
+{
+  WCHAR *ptr = GetEnvironmentStringsW();
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_GETENVIRONMENTSTRINGS 1\n" >> config.h
+  have_windows_h=y
+else
+  printf "no\n"
+fi
+
+#
+# fork, pipe, exec, waitpid.
+#
+
+printf "Checking for POSIX fork/pipe/exec/waitpid ... "
+
+cat > conftest.c <<!
+#include "config.h"
+#ifdef HAVE_SYS_WAIT
+#include <sys/wait.h>
+#endif
+#include <sys/types.h>
+#include <unistd.h>
+
+int main(int argc, char **argv)
+{
+  int status, fd[2];
+  pid_t p = fork();
+  int res = pipe(fd);
+  (void) execvp(argv[0], argv);
+  (void) waitpid(p, &status, 0);
+  (void) res;
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_FORK_STUFF 1\n" >> config.h
+  have_unistd=y
+  have_sys_types=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for POSIX getppid ... "
+
+cat > conftest.c <<!
+#include <sys/types.h>
+#include <unistd.h>
+
+int main(int argc, char **argv)
+{
+  pid_t p = getppid();
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_GETPPID 1\n" >> config.h
+  have_unistd=y
+  have_sys_types=y
+else
+  printf "no\n"
+fi
+
+#
+# fcntl
+#
+
+printf "Checking for POSIX fcntl ... "
+
+cat > conftest.c <<!
+#include "config.h"
+#include <fcntl.h>
+
+int main(int argc, char **argv)
+{
+  int err = fcntl(0, F_SETFD, FD_CLOEXEC);
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_FCNTL_H 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+#
+# poll
+#
+
+printf "Checking for poll ... "
+
+cat > conftest.c <<!
+#include <poll.h>
+#include "config.h"
+
+int main(int argc, char **argv)
+{
+  static struct pollfd fds[42];
+  nfds_t n = 42;
+  int err = poll(fds, 42, 1000);
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_POLL 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+#
+# Check for fields inside struct tm
+#
+
+printf "detecting timezone fields in struct tm ... "
+
+for try_field in tm_gmtoff __tm_gmtoff ; do
+  cat > conftest.c <<!
+#include <time.h>
+int x = sizeof ((struct tm *) 0)->$try_field;
+!
+  if conftest_o ; then
+    printf "#define HAVE_TM_GMTOFF 1\n" >> config.h
+    printf "#define TM_GMTOFF %s\n" $try_field >> config.h
+    break
+  fi
+done
+
+for try_field in tm_zone __tm_zone ; do
+  cat > conftest.c <<!
+#include <time.h>
+int x = sizeof ((struct tm *) 0)->$try_field;
+!
+  if conftest_o ; then
+    printf "#define HAVE_TM_ZONE 1\n" >> config.h
+    printf "#define TM_ZONE %s\n" $try_field >> config.h
+    break
+  fi
+done
+
+printf "done\n"
+
+printf "Checking for timegm function ... "
+
+cat > conftest.c <<!
+#include <time.h>
+
+int main(void)
+{
+  time_t (*ptgm)(struct tm *) = &timegm;
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_TIMEGM 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+printf "Checking for setenv and unsetenv functions ... "
+
+cat > conftest.c <<!
+#include <stdlib.h>
+
+int main(void)
+{
+  setenv("TERM", "foo", 1);
+  unsetenv("TERM");
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_SETENV 1\n" >> config.h
+else
+  printf "no\n"
+fi
+printf "Checking for tzset function ... "
+
+cat > conftest.c <<!
+#include <time.h>
+
+int main(void)
+{
+  tzset();
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_TZSET 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+printf "Checking for localtime_r and gmtime_r functions ... "
+
+cat > conftest.c <<!
+#include <time.h>
+
+int main(int argc, char **argv)
+{
+  struct tm stm;
+  time_t t;
+
+  localtime_r(&t, &stm);
+  gmtime_r(&t, &stm);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_GMTIME_R 1\n" >> config.h
+  have_unistd=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for strptime function ... "
+
+cat > conftest.c <<!
+#include <time.h>
+
+int main(int argc, char **argv)
+{
+  struct tm stm = { 0 };
+  strptime("2016-08-20 00:00:00", "%Y-%m-%d %H:%M:%S", &stm);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_STRPTIME 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+printf "Checking for POSIX sleep function ... "
+
+cat > conftest.c <<!
+#include <unistd.h>
+
+int main(int argc, char **argv)
+{
+  sleep(42);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_POSIX_SLEEP 1\n" >> config.h
+  have_unistd=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for POSIX usleep function ... "
+
+cat > conftest.c <<!
+#include <unistd.h>
+
+int main(int argc, char **argv)
+{
+  usleep(42);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_POSIX_USLEEP 1\n" >> config.h
+  have_unistd=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for POSIX nanosleep function ... "
+
+cat > conftest.c <<!
+#include <time.h>
+
+int main(int argc, char **argv)
+{
+  struct timespec ts;
+  nanosleep(&ts, &ts);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_POSIX_NANOSLEEP 1\n" >> config.h
+  have_unistd=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for BSD daemon function ... "
+
+cat > conftest.c <<!
+#include <stdlib.h>
+#include <unistd.h>
+
+int main(int argc, char **argv)
+{
+  int (*pdaemon)(int, int) = &daemon;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_DAEMON 1\n" >> config.h
+  have_unistd=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for isatty function ... "
+
+cat > conftest.c <<!
+#include <unistd.h>
+
+int main(void)
+{
+  isatty(0);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_ISATTY 1\n" >> config.h
+  have_unistd=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for syslog ... "
+
+cat > conftest.c <<!
+#include <syslog.h>
+
+int main(void)
+{
+  openlog("foo", LOG_CONS, LOG_DAEMON);
+  syslog(LOG_EMERG, "bar %d\n", 3);
+  setlogmask(0);
+  closelog();
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_SYSLOG 1\n" >> config.h
+  have_syslog=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for reasonably modern POSIX signal handling ... "
+
+cat > conftest.c <<!
+#include <signal.h>
+#include <setjmp.h>
+
+int main(void)
+{
+  sigjmp_buf jb;
+  static struct sigaction olda, newa;
+  static sigset_t olds, news;
+  sigaction(0, &newa, &olda);
+  sigprocmask(SIG_BLOCK, &news, &olds);
+  if (!sigsetjmp(jb, 1)) 
+    siglongjmp(jb, 1);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_POSIX_SIGS 1\n" >> config.h
+  have_posix_sigs=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for sigaltstack ... "
+
+cat > conftest.c <<!
+#include <signal.h>
+#include <stdlib.h>
+
+int main(void)
+{
+  stack_t ss;
+  ss.ss_sp = malloc(SIGSTKSZ);
+  ss.ss_size = SIGSTKSZ;
+  ss.ss_flags = 0;
+  return sigaltstack(&ss, 0);
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_SIGALTSTACK 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+printf "Checking for setitimer/getitimer ... "
+
+cat > conftest.c <<!
+#include <sys/time.h>
+
+int main(void)
+{
+  struct itimerval itv, itv2;
+  int err;
+  err = getitimer(ITIMER_REAL, &itv);
+  err = getitimer(ITIMER_VIRTUAL, &itv);
+  err = setitimer(ITIMER_VIRTUAL, &itv, &itv2);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_ITIMER 1\n" >> config.h
+  have_sys_time=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for makedev ... "
+
+for try_header in sysmacros types ; do
+  cat > conftest.c <<!
+#include <sys/${try_header}.h>
+
+int main(void)
+{
+  int d = makedev(1, 2);
+  int j = major(d);
+  int n = minor(d);
+  return 0;
+}
+!
+  if conftest ; then
+    printf "yes\n"
+    printf "#define HAVE_MAKEDEV 1\n" >> config.h
+    case $try_header in
+    sysmacros )
+      printf "#define HAVE_SYS_SYSMACROS_H 1\n" >> config.h
+      ;;
+    types )
+      have_sys_types=y
+      ;;
+    esac
+    have_makedev=y
+    break
+  fi
+done
+
+if [ -z "$have_makedev" ] ; then
+  printf "no\n"
+fi
+
+printf "Checking for link, symlink and readlink ... "
+
+cat > conftest.c <<!
+#include <unistd.h>
+
+int main(void)
+{
+  int e1 = symlink("a", "b");
+  int e2 = link("c", "d");
+  char buf[256];
+  ssize_t foo = readlink("e", buf, sizeof buf);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_SYMLINK 1\n" >> config.h
+  have_unistd=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for POSIX mkdir ... "
+
+cat > conftest.c <<!
+#include "config.h"
+#include <sys/stat.h>
+#if HAVE_WINDOWS_H
+#include <windows.h>
+#endif
+
+int main(void)
+{
+  int e = mkdir("a", 0);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_MKDIR 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+printf "Checking for mknod ... "
+
+cat > conftest.c <<!
+#include "config.h"
+#include <unistd.h>
+#if HAVE_SYS_STAT
+#include <sys/stat.h>
+#endif
+
+int main(void)
+{
+  int e = mknod("a", 0, 0);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_MKNOD 1\n" >> config.h
+  have_unistd=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for chmod ... "
+cat > conftest.c <<!
+#include <sys/stat.h>
+
+int main(void)
+{
+  int r = chmod("a", S_IWUSR);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_CHMOD 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+printf "Checking for pipe ... "
+cat > conftest.c <<!
+#include <unistd.h>
+
+int main(void)
+{
+  int p[2];
+  int r = pipe(p);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_PIPE 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+printf "Checking for ftruncate ... "
+cat > conftest.c <<!
+#include <unistd.h>
+
+int main(void)
+{
+  int e = ftruncate(0, 42);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_FTRUNCATE 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+printf "Checking for _wspawnlp ... "
+
+cat > conftest.c <<!
+#include "config.h"
+#include <process.h>
+#include <wchar.h>
+
+int main(int argc, char **argv)
+{
+  wchar_t *wargv[] = { L"foo", L"bar", 0 };
+  int r = _wspawnlp(_P_WAIT, L"foo", wargv);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_WSPAWN 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+printf "Checking for chsize ... "
+cat > conftest.c <<!
+#include <unistd.h>
+
+int main(void)
+{
+  int e = chsize(0, 42);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_CHSIZE 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+
+printf "Checking for log2 ... "
+
+cat > conftest.c <<!
+#include <math.h>
+
+int main(void)
+{
+  double x = log2(42.0);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_LOG2 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+printf "Checking for round ... "
+cat > conftest.c <<!
+#include <math.h>
+
+int main(void)
+{
+  double x = round(0.5);
+  return 0;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_ROUND 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+
+
+printf "Checking for glob ... "
+
+cat > conftest.c <<!
+#include <glob.h>
+
+static int errfunc(const char *path, int err)
+{
+  return 0;
+}
+
+int main(void)
+{
+  glob_t gl;
+  int result = glob("*", GLOB_ERR, errfunc, &gl);
+  globfree(&gl);
+  return result;
+}
+!
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_GLOB 1\n" >> config.h
+  have_glob=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for nftw ... "
+
+cat > conftest.c <<!
+#include <ftw.h>
+#include <stdlib.h>
+
+static int callback(const char *fpath, const struct stat *sb,
+                    int tflag, struct FTW *ftwbuf)
+{
+   switch (tflag) {
+   case FTW_D:
+   case FTW_DP:
+   case FTW_NS:
+   case FTW_SLN:
+     break;
+   }
+   return 0;
+}
+
+int main(int argc, char *argv[])
+{
+   int flags = FTW_DEPTH | FTW_PHYS;
+   int res = nftw(argv[1], callback, 20, flags);
+   return (res == -1) ? EXIT_FAILURE : 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_FTW 1\n" >> config.h
+  have_ftw=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for fnmatch ... "
+
+cat > conftest.c <<!
+#include <fnmatch.h>
+
+int main(int argc, char *argv[])
+{
+  int res = fnmatch("*.txr", "foo.txr", FNM_PATHNAME);
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_FNMATCH 1\n" >> config.h
+  have_ftw=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for windres ... "
+
+if output=$(windres -V 2> /dev/null) ; then
+  printf "yes\n"
+  have_windres=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for POSIX geteuid function family ... "
+
+cat > conftest.c <<!
+#include <sys/types.h>
+#include <unistd.h>
+
+int main(int argc, char **argv)
+{
+  uid_t u = getuid();
+  uid_t e = geteuid();
+  gid_t g = getgid();
+  gid_t h = getegid();
+  setuid(u);
+  seteuid(e);
+  setgid(g);
+  setegid(h);
+  getgroups(0, NULL);
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_GETEUID 1\n" >> config.h
+  have_unistd=y
+  have_sys_types=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for {set,get}res{uid,gid} ... "
+
+cat > conftest.c <<!
+#include <sys/types.h>
+#include <unistd.h>
+
+int main(int argc, char **argv)
+{
+  uid_t ur, ue, us;
+  gid_t gr, ge, gs;
+  int gur = getresuid(&ur, &ue, &us);
+  int ggr = getresgid(&gr, &ge, &gs);
+  int sur = setresuid(0, 0, 0);
+  int sgr = setresgid(0, 0, 0);
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_SETRESUID 1\n" >> config.h
+  have_unistd=y
+  have_sys_types=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for setgroups ... "
+
+cat > conftest.c <<!
+#include <sys/types.h>
+#include <unistd.h>
+#include <grp.h>
+
+int main(int argc, char **argv)
+{
+  int res = setgroups(0, 0);
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_SETGROUPS 1\n" >> config.h
+  have_unistd=y
+elif conftest EXTRA_FLAGS=-D__EXTENSIONS__=1 ; then
+  printf "yes\n"
+  printf "#define HAVE_SETGROUPS 1\n" >> config.h
+  lang_flags="$lang_flags -D__EXTENSIONS__=1" # Solaris buggery
+  have_unistd=y
+  have_sys_types=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for old school getpwent, getpwuid and getpwnam ... "
+
+cat > conftest.c <<!
+#include <sys/types.h>
+#include <pwd.h>
+
+int main(void)
+{
+  struct passwd *p = getpwent();
+  struct passwd *q = getpwnam("root");
+  struct passwd *r = getpwuid(0);
+  setpwent();
+  endpwent();
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_PWUID 1\n" >> config.h
+  have_pwuid=y
+  have_sys_types=y
+else
+  printf "no\n"
+fi
+
+if [ "$have_pwuid" ]; then
+  printf "Checking for getpwent_r, getpwuid_r, and getpwnam_r ... "
+
+  cat > conftest.c <<!
+#include <sys/types.h>
+#include <pwd.h>
+
+int main(void)
+{
+  struct passwd pw;
+  struct passwd *p;
+  char buf[1024];
+  int r0 = getpwent_r(&pw, buf, sizeof buf, &p);
+  int r1 = getpwuid_r(0, &pw, buf, sizeof buf, &p);
+  int r2 = getpwnam_r("root", &pw, buf, sizeof buf, &p);
+  return 0;
+}
+!
+
+  if conftest ; then
+    printf "yes\n"
+    printf "#define HAVE_PWUID_R 1\n" >> config.h
+  else
+    printf "no\n"
+  fi
+fi
+
+printf "Checking for old school getgrent, getgrgid and getgrnam ... "
+
+cat > conftest.c <<!
+#include <sys/types.h>
+#include <grp.h>
+
+int main(void)
+{
+  struct group *g = getgrent();
+  struct group *h = getgrnam("root");
+  struct group *i = getgrgid(0);
+  setgrent();
+  endgrent();
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_GRGID 1\n" >> config.h
+  have_grgid=y
+else
+  printf "no\n"
+fi
+
+if [ "$have_grgid" ]; then
+  printf "Checking for getgrgid_r and getgrnam_r ... "
+
+  cat > conftest.c <<!
+#include <sys/types.h>
+#include <grp.h>
+
+int main(void)
+{
+  struct group gr;
+  struct group *g;
+  char buf[1024];
+  int r1 = getgrgid_r(0, &gr, buf, sizeof buf, &g);
+  int r2 = getgrnam_r("root", &gr, buf, sizeof buf, &g);
+  return 0;
+}
+!
+
+  if conftest ; then
+    printf "yes\n"
+    printf "#define HAVE_GRGID_R 1\n" >> config.h
+  else
+    printf "no\n"
+  fi
+fi
+
+printf "Checking for crypt ... "
+
+cat > conftest.c <<!
+#include <unistd.h>
+
+int main(void)
+{
+  char *c = crypt("foo", "bar");
+  return 0;
+}
+!
+
+for try_lcrypt in "" "-lcrypt" "no" ; do
+  if [ "$try_lcrypt" = "no" ] ; then
+    printf "no\n"
+    break
+  fi
+  if conftest EXTRA_LDFLAGS=$try_lcrypt; then
+    printf "yes\n"
+    printf "#define HAVE_CRYPT 1\n" >> config.h
+    if [ -n "$try_lcrypt" ] ; then
+      conf_ldflags="${conf_ldflags:+"$conf_ldflags "}-lcrypt"
+    fi
+    break;
+  fi
+done
+
+printf "Checking for alloca ... "
+
+for try_header in alloca.h malloc.h ; do
+  cat > conftest.c <<!
+#include <$try_header>
+
+int main(int argc, char **argv)
+{
+  void *bytes = alloca(42);
+  return 0;
+}
+!
+
+  if conftest ; then
+    printf "yes\n"
+    printf "#define HAVE_ALLOCA 1\n" >> config.h
+    printf "#define ALLOCA_H <%s>\n" $try_header >> config.h
+    have_alloca=y
+    break;
+  fi
+done
+
+if [ -z "$have_alloca" ] ; then
+  printf "no\n"
+  printf "TXR requires the alloca function.\n"
+  exit 1
+fi
+
+printf "Checking for termios ... "
+
+cat > conftest.c <<!
+#include <termios.h>
+
+int main(int argc, char **argv)
+{
+  struct termios t;
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_TERMIOS 1\n" >> config.h
+  have_termios=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for struct winsize ... "
+
+for termios_define in NOTHING __EXTENSIONS__ ; do
+  cat > conftest.c <<!
+#define $termios_define
+#include <sys/ioctl.h>
+#include <termios.h>
+
+int main(int argc, char **argv)
+{
+  struct winsize ws;
+  return 0;
+}
+!
+  if conftest ; then
+    printf "yes\n"
+    printf "#define HAVE_WINSIZE 1\n" >> config.h
+    have_winsize=y
+    break;
+  fi
+done
+
+if [ -z "$have_winsize" ] ; then
+  printf "no\n"
+fi
+
+printf "Checking for mkstemps ... "
+
+cat > conftest.c <<!
+#include <stdlib.h>
+
+int main(int argc, char **argv)
+{
+  char templ[] = "abcXXXXXX.xyz";
+  int fd = mkstemps(templ, 4);
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_MKSTEMPS 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+#
+# Low stack size on Windows fails the man or boy test case.
+#
+
+printf "Do we need to set stack size ... "
+
+if uname -a | grep -q -E 'MINGW|CYGWIN' ; then
+  conf_ldflags="-Wl,--stack,16777216${conf_ldflags:+" $conf_ldflags"}"
+  printf "yes\n"
+else
+  printf "no\n"
+fi
+
+#
+# Do we have fseeko and ftello?
+#
+
+printf "Checking for fseeko and ftello ... "
+
+cat > conftest.c <<!
+#include <stdio.h>
+#include <sys/types.h>
+
+int main(int argc, char **argv)
+{
+  int res = fseeko(stdin, 0, SEEK_CUR);
+  off_t pos = ftello(stdin);
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_FSEEKO 1\n" >> config.h
+  have_sys_types=y
+elif conftest EXTRA_FLAGS=-D_LARGEFILE_SOURCE ; then
+  printf "yes\n"
+  printf "#define HAVE_FSEEKO 1\n" >> config.h
+  lang_flags="$lang_flags -D_LARGEFILE_SOURCE"
+  have_sys_types=y
+else
+  printf "no\n"
+fi
+
+printf "Checking how to enable 64 bit file offsets ... "
+
+file_offset_define=none
+
+for try in NOTHING _LARGE_FILES=1 _FILE_OFFSET_BITS=64 ; do
+  cat > conftest.c <<!
+#include <sys/types.h>
+char SIZEOF_OFF_T[sizeof (off_t)];
+char DUMMY;
+!
+  if ! conftest_syms VERBOSE=y EXTRA_FLAGS=-D$try ; then
+    printf "failed\n\n"
+
+    printf "Errors from compilation: \n\n"
+    cat conftest.err
+    exit 1
+  fi
+
+  SIZEOF_OFF_T=0
+
+  read_syms
+
+  if [ $SIZEOF_OFF_T -eq 0 ] ; then
+    printf "failed\n"
+    exit 1
+  fi
+
+  if [ $SIZEOF_OFF_T -eq 8 ] ; then
+    if [ $try = NOTHING ] ; then
+      printf "default\n"
+      file_offset_define=
+    else
+      printf -- "-D%s\n" $try
+      file_offset_define=$try
+    fi
+    break;
+  fi
+done
+
+if [ "$file_offset_define" = none ] ; then
+  printf "unable\n"
+elif [ -n "$file_offset_define" ] ; then
+  lang_flags="$lang_flags -D$file_offset_define"
+fi
+
+printf "Checking for socket API ... "
+
+cat > conftest.c <<!
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/un.h>
+
+int main(int argc, char **argv)
+{
+  static struct sockaddr_in in_addr;
+  static struct sockaddr_un un_addr;
+  static char buf[256];
+  socklen_t len;
+
+  int s = socket(AF_INET, SOCK_STREAM, 0);
+  int e0 = bind(s, (struct sockaddr *) &in_addr, sizeof in_addr);
+  int e1 = listen(s, 42);
+  int e3 = connect(s, (struct sockaddr *) &un_addr, sizeof un_addr);
+  int e4 = send(s, buf, sizeof buf, 0);
+  int e5 = sendto(s, buf, sizeof buf, 0,
+                  (struct sockaddr *) &un_addr, sizeof un_addr);
+  int e6 = recv(s, buf, sizeof buf, 0);
+  int e7 = (len = sizeof in_addr,
+            recvfrom(s, buf, sizeof buf, 0,
+                     (struct sockaddr *) &in_addr, &len));
+  int e8 = shutdown(s, 0);
+  in_addr_t ia = inet_addr("10.0.0.1");
+
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_SOCKETS 1\n" >> config.h
+  have_sockets=y
+  have_sys_types=y
+elif conftest EXTRA_LDFLAGS="-lsocket -lnsl" ; then
+  printf "yes\n"
+  printf "#define HAVE_SOCKETS 1\n" >> config.h
+  have_sockets=y
+  have_sys_types=y
+  conf_ldflags="${conf_ldflags:+"$conf_ldflags "}-lsocket -lnsl"
+  printf "Need libs for sockets: regenerating config.make ..."
+  gen_config_make
+  printf "done\n"
+else
+  printf "no\n"
+fi
+
+printf "Checking for getaddrinfo ... "
+
+cat > conftest.c <<!
+#include <sys/types.h>
+#include <netdb.h>
+#include <stdio.h>
+
+int main(void)
+{
+  struct addrinfo hints;
+  struct addrinfo *ptr;
+  int res = getaddrinfo("node", "serv", &hints, &ptr);
+  freeaddrinfo(ptr);
+  puts(gai_strerror(res));
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_GETADDRINFO 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+printf "Checking for uname ... "
+
+cat > conftest.c <<!
+#include <sys/utsname.h>
+#include <stdio.h>
+
+int main(void)
+{
+  struct utsname utn;
+  if (uname(&utn) == 0)
+    printf("%s:%s:%s:%s:%s\n", utn.sysname,
+           utn.nodename, utn.release, utn.version,
+           utn.machine);
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_UNAME 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+printf "Checking for domainname in struct utsname ... "
+
+cat > conftest.c <<!
+#include <sys/utsname.h>
+#include <stdio.h>
+
+int main(void)
+{
+  struct utsname utn;
+  if (uname(&utn) == 0)
+    printf("%s\n", utn.domainname);
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_UTSNAME_DOMAINNAME 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+printf "Checking for dlopen ... "
+
+cat > conftest.c <<!
+#include <dlfcn.h>
+
+int main(void)
+{
+  void *lib = dlopen("foo.so", 0);
+  void *sym = dlsym(lib, "bar");
+#if TEST_DLVSYM
+  void *vsym = dlvsym(lib, "bar", "1");
+#endif
+  dlclose(lib);
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_DLOPEN 1\n" >> config.h
+elif conftest EXTRA_LDFLAGS=-ldl ; then
+  printf "yes\n"
+  printf "#define HAVE_DLOPEN 1\n" >> config.h
+  conf_ldflags="${conf_ldflags:+"$conf_ldflags "}-ldl"
+else
+  printf "no\n"
+fi
+
+printf "Checking for dlvsym ... "
+if conftest CONF_LDFLAGS="$conf_ldflags" EXTRA_FLAGS=-DTEST_DLVSYM=1 ; then
+  printf "yes\n"
+  printf "#define HAVE_DLVSYM 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+printf "Checking for pkg-config ... "
+
+if pkg-config --version > /dev/null 2>&1 ; then
+  printf "present\n"
+  have_pkgconfig=y
+else
+  printf "absent\n"
+fi
+
+printf "Checking for libffi ... "
+
+cat > conftest.c <<!
+#include <stdio.h>
+#include <ffi.h>
+
+int main(void)
+{
+  ffi_cif cif;
+  ffi_type *args[1];
+  void *values[1];
+  char *s;
+  args[0] = &ffi_type_pointer;
+  values[0] = &s;
+  return ffi_prep_cif(&cif, FFI_DEFAULT_ABI, 1, &ffi_type_sint, args) != FFI_OK;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_LIBFFI 1\n" >> config.h
+elif conftest EXTRA_LDFLAGS=-lffi ; then
+  printf "yes\n"
+  printf "#define HAVE_LIBFFI 1\n" >> config.h
+  conf_ldflags="${conf_ldflags:+"$conf_ldflags "}-lffi"
+elif [ -n "$have_pkgconfig" ] && pkg-config --exists libffi ; then
+  libffi_cflags=$(pkg-config --cflags libffi)
+  libffi_ldflags=$(pkg-config --libs libffi)
+  if conftest EXTRA_FLAGS="$libffi_cflags" EXTRA_LDFLAGS="$libffi_ldflags" ; then
+    printf "yes\n"
+    printf "#define HAVE_LIBFFI 1\n" >> config.h
+    conf_ldflags="${conf_ldflags:+"$conf_ldflags "}$libffi_ldflags"
+  else
+    printf "no\n"
+    libffi_cflags=
+  fi
+else
+  printf "no\n"
+fi
+
+printf "Checking for clockid_t ... "
+cat > conftest.c <<!
+#include <sys/types.h>
+
+int main(void)
+{
+  clockid_t cid = 0;
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_CLOCKID_T 1\n" >> config.h
+  have_sys_types=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for loff_t ... "
+cat > conftest.c <<!
+#include <sys/types.h>
+
+int main(void)
+{
+  loff_t lo = 0;
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_LOFF_T 1\n" >> config.h
+  have_sys_types=y
+else
+  printf "no\n"
+fi
+
+printf "Checking for realpath ... "
+cat > conftest.c <<!
+#include <stdlib.h>
+
+int main(void)
+{
+  char *rp = realpath("/var/lib", 0);
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_REALPATH 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+printf "Checking for getexecname ... "
+cat > conftest.c <<!
+#include <stdlib.h>
+
+int main(void)
+{
+  const char *rp = getexecname();
+  return 0;
+}
+!
+
+if conftest ; then
+  printf "yes\n"
+  printf "#define HAVE_GETEXECNAME 1\n" >> config.h
+else
+  printf "no\n"
+fi
+
+#
+# Dependent variables
+#
+
+if [ -n "$have_unistd" ] ; then
+  printf "#define HAVE_UNISTD_H 1\n" >> config.h
+fi
+
+if [ -n "$have_sys_types" ] ; then
+  printf "#define HAVE_SYS_TYPES_H 1\n" >> config.h
+fi
+
+if [ -n "$have_sys_time" ] ; then
+  printf "#define HAVE_SYS_TIME 1\n" >> config.h
+fi
+
+if [ -n "$have_windows_h" ] ; then
+  printf "#define HAVE_WINDOWS_H 1\n" >> config.h
+fi
+
+#
+# Extra debugging.
+#
+
+if [ -n "$extra_debugging" ] ; then
+  printf "Configuring extra debugging, as requested ...\n"
+  printf "#define CONFIG_EXTRA_DEBUGGING 1\n" >> config.h
+fi
+
+#
+# Clean up
+#
+
+$make conftest.clean
+
+#
+# Some final blurbs into config.h
+#
+
+[ -n "$debug_support" ] && printf "#define CONFIG_DEBUG_SUPPORT 1\n" >> config.h
+[ -n "$gen_gc" ] && printf "#define CONFIG_GEN_GC 1\n" >> config.h
+
+#
+# Regenerate config.make
+#
+
+printf "Regenerating config.make ... "
+gen_config_make
+printf "done\n"
+
+#
+# Save configuration in config.log
+#
+cat > config.log <<!
+
+Configured on $(date) using
+
+   $cmdline
+
+!
+#
+# Parting message
+#
+cat <<!
+
+The configuration seems to have been successful. That doesn't mean it's
+correct!  Please check the above output for any problems, and verify that the
+contents of the generated files config.make and config.h are sane for the
+target platform.
+
+The next step is to build the program with $make.
+
+If that is successful, please follow the INSTALL guide.
+
+Usually, most users just need to "$make tests" and "$make install",
+possibly switching to superuser for "$make install" if the prefix
+points to a privileged location like /usr/local/.
+
+!

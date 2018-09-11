@@ -1,0 +1,31 @@
+@(do
+  (progn
+    (macro-time
+      (defmacro rem-num (:env menv some-form)
+        (let ((expanded (macroexpand some-form menv)))
+          (if (numberp (car expanded))
+            (cdr expanded)
+            some-form))))
+
+    (prinl
+      (macrolet ((foo () '(1 list 42))
+                 (bar () '(list 'a)))
+        (symacrolet ((x (bar)))
+          (list (rem-num (foo)) (rem-num x)))))
+
+    (prinl
+      (let ((x 0) (y 1))
+        (symacrolet ((a x) (b y))
+          (flet ((x (. args) [apply list args]))
+            [x y]))))
+
+    (prinl
+      (let ((x 0))
+        (symacrolet ((a (inc x)))
+          (list
+            (let* ((a a)
+                   (b a))
+              (list a b))
+            (let ((a a)
+                  (b a))
+              (list a b))))))))

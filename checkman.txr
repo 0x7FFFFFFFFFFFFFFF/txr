@@ -1,0 +1,135 @@
+@(name file)
+@;;
+@;; Check syntax block after function
+@;;
+@(define check-synb ())
+.synb
+@  (assert bad ln `bad .synb block`)
+@  (repeat :gap 0 :min 1)
+.mets @(skip)
+@    (maybe)
+@      (repeat :gap 0 :mintimes 1)
+.mets \ \ @(skip)
+@      (last :mandatory)
+
+@      (trailer)
+.mets @(skip)
+@      (end)
+@    (end)
+@  (last :mandatory)
+.syne
+@  (end)
+@  (assert bad ln `missing .desc`)
+.desc
+@  (assert bad ln `blank line after .desc`)
+@/..*/
+@(end)
+@;;
+@;; Check variable description headings
+@;;
+@(define check-var ())
+@  (cases)
+@;   exception
+.coNP @/Variables|Special variables/ @@, s-ifmt @(skip)
+@    (or)
+@;   exception
+.coNP @/Variables|Special variables/ @@, *0 @(skip)
+@    (or)
+.coNP @/Variables|Special variables/@(assert bad ln `bad Variables heading`)@(rep :gap 0) @@, @{x /\S+/}@(last :mandatory) @@ @y and @@ @{z /\S+/}@(end)
+@      (assert bad ln `no .desc after variables heading`)
+.desc
+@    (or)
+.coNP @/Variable|Special variable/@(assert bad ln `bad Variable heading`) @{x /\S+/}
+@      (assert bad ln `no .desc after variable heading`)
+.desc
+@  (end)
+@(end)
+@;;
+@;; Check function/macro/operator headings
+@;;
+@(define check-func ())
+@  (cases)
+.coNP Operator/function @(skip)
+@      (assert bad ln `no .synb after Operator/function heading`)
+@      (check-synb)
+@    (or)
+.coNP Operator @@ @op and macro @@ @mac
+@      (assert bad ln `no .synb after Operator and macro heading`)
+@      (check-synb)
+@    (or)
+.coNP @{type /Function|Operator|Macro|Accessor|Method|Structure/}s@(assert bad ln `bad @{type}s heading`)@(rep :gap 0) @@, @{x /\S+/}@(last :mandatory) @@ @y and @@ @{z /\S+/}@(end)
+@      (assert bad ln `no .synb after @{type}s heading`)
+@      (check-synb)
+@    (or)
+.coNP @{type /Function|Operator|Macro|Accessor|Method|Structure|Parameter list macro/}@(assert bad ln `bad @type heading`) @@ @{x /\S+/}@junk
+@      (assert bad ln `extra elements in singular @type heading`)
+@      (bind junk "")
+@      (assert bad ln `no .synb after @type heading`)
+@      (check-synb)
+@  (end)
+@(end)
+@;;
+@;; check .code, .codn, .cod2, .cod3, .meta and .metn.
+@;;
+@(define check-code ())
+@  (cases)
+.@{type /code|meta/} "@(assert bad ln `.@type needs one argument`)@x"@(eol)
+@  (or)
+.@{type /code|meta/}@(assert bad ln `.@type needs one argument`) @{x /\S+/}@(eol)
+@  (or)
+.cod3 @(assert bad ln `.cod3 needs three arguments`)@x @y @{z /\S+/}@(eol)
+@  (or)
+.@{type /codn|cod2|metn/} @(assert bad ln `.@type needs two arguments`)@(cases)"@x"@(or)@{x /\S+/}@(end) @{y /\S+/}@(eol)
+@    (assert bad ln `.codn second argument doesn't begin with punctuation`)
+@    (require (or (not (memqual type '("codn" "metn")))
+                  (chr-ispunct [y 0])))
+@  (end)
+@(end)
+@;;
+@;; Check .cblk/.cble pairing
+@;;
+@(define check-cblk ())
+.cblk
+@  (assert bad ln `.cblk not closed`)
+@  (repeat :gap 0)
+@    (none)
+.cblk
+@    (end)
+@  (last :mandatory)
+.cble
+@  (end)
+@(end)
+@;;
+@;; Check for various dangling
+@;; macros.
+@;;
+@(define check-spurious ())
+@  {mac /.(cble|syne)/}@(skip)
+@  (throw bad ln `dangling @mac`)
+@(end)
+@;;
+@;; Main
+@;;
+@(bind errors 0)
+@(repeat)
+@  (line ln)
+@  (try)
+@    (cases)
+@      (check-var)
+@    (or)
+@      (check-func)
+@    (or)
+@      (check-code)
+@    (or)
+@      (check-cblk)
+@    (or)
+@      (check-synb)
+@    (or)
+@      (check-spurious)
+@    (end)
+@  (catch bad (line msg))
+@    (do (inc errors)
+         (put-line `@file:@line:@msg`))
+@  (end)
+@(end)
+@(do (exit (zerop errors)))

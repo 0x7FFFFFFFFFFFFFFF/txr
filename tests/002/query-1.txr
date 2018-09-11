@@ -1,0 +1,34 @@
+@(next `!ls @TESTDIR/proc | sort -n`)
+@(collect)
+@{process /[0-9]+/}
+@  (next `@TESTDIR/proc/@process/status` :nothrow)
+Name:	@name
+State:	@state (@state_desc)
+SleepAVG:	@sleep_avg%
+Tgid:	@tgid
+Pid:	@proc_id
+PPid:	@parent_id
+@(bind pid proc_id)
+@(bind ppid parent_id)
+@(skip)
+Uid:	@uid	@/.*/
+Gid:	@gid	@/.*/
+@  (next `@TESTDIR/proc/@process/tasks`)
+@  (collect)
+@thr
+@  (end)
+@  (bind thread thr)
+@  (some)
+@    (next `@TESTDIR/etc/passwd`)
+@    (skip)
+@user:@pw:@uid:@/.*/
+@  (and)
+@    (bind user uid)
+@  (end)
+@(end)
+@(output)
+USER       PID  PPID S NAME             THREADS
+@  (repeat)
+@{user 8} @{proc_id -5} @{parent_id -5} @state @{name 16} @(rep)@thr, @(first)@(last)@thr@(single)-@(end)
+@  (end)
+@(end)

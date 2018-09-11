@@ -1,0 +1,29 @@
+rec	rng	-rng	rng-	-rng-	--rng-	--rng	rng+	-rng+	--rng+	Y1Y2
+X1	t		t				t			
+a	t	t	t	t			t	t		
+b	t	t	t	t			t	t		
+X1	t	t	t	t			t	t		
+c	t	t	t	t			t	t		
+X2	t	t	t	t			t	t		
+1	t	t	t	t	t	t	t	t	t	
+2	t	t	t	t	t	t	t	t	t	
+3	t	t	t	t	t	t	t	t	t	
+Y1	t	t				t	t	t	t	t
+r							t	t	t	t
+s							t	t	t	t
+Y2							t	t	t	t
+t										
+Y2										
+X1X2	t		t				t			
+Y1Y2	t	t				t	t	t	t	t
+X1X2	t		t				t			
+Y1	t	t				t	t	t	t	t
+a							t	t	t	t
+Y2							t	t	t	t
+X1X2Y1Y2	t						t	t	t	t
+a										
+X1X2Y1Y2	t						t			t
+X1X2Y1Y2	t						t	t		t
+X1	t		t				t			
+b	t	t	t	t			t	t	t	
+X2	t	t	t	t			t	t	t	
